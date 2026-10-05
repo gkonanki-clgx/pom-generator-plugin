@@ -9,6 +9,11 @@ import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.project.MavenProject;
 import org.apache.maven.repository.internal.MavenRepositorySystemUtils;
+import org.apache.maven.settings.Server;
+import org.apache.maven.settings.Proxy;
+import org.apache.maven.settings.building.SettingsProblem;
+import org.apache.maven.settings.crypto.SettingsDecrypter;
+import org.apache.maven.settings.crypto.SettingsDecryptionResult;
 import org.eclipse.aether.RepositorySystem;
 import org.eclipse.aether.repository.LocalRepository;
 import org.junit.Rule;
@@ -157,7 +162,11 @@ public class GenerateBomMojoTest {
             RepositorySystem system = MavenRepositorySystemUtils.newServiceLocator().getService(RepositorySystem.class);
             var resolver = MavenRepositorySystemUtils.newSession();
             resolver.setLocalRepositoryManager(system.newLocalRepositoryManager(resolver, new LocalRepository(repo.toFile())));
-            var session = new MavenSession(null, resolver, new DefaultMavenExecutionRequest(), new DefaultMavenExecutionResult());
+            Server credentials = new Server();
+            credentials.setId("github");
+            credentials.setPassword("synthetic-test-credential");
+            var request = new DefaultMavenExecutionRequest().addServer(credentials);
+            var session = new MavenSession(null, resolver, request, new DefaultMavenExecutionResult());
             var project = new MavenProject();
             project.setRemoteArtifactRepositories(List.of());
             GenerateBomMojo mojo = new GenerateBomMojo();
@@ -178,6 +187,13 @@ public class GenerateBomMojoTest {
             set(mojo, "session", session);
             set(mojo, "project", project);
             set(mojo, "repositorySystem", system);
+            set(mojo, "settingsDecrypter", (SettingsDecrypter) ignored -> new SettingsDecryptionResult() {
+                @Override public Server getServer() { return credentials; }
+                @Override public List<Server> getServers() { return List.of(credentials); }
+                @Override public Proxy getProxy() { return null; }
+                @Override public List<Proxy> getProxies() { return List.of(); }
+                @Override public List<SettingsProblem> getProblems() { return List.of(); }
+            });
             return mojo;
         }
         JsonNode report() throws Exception { return JSON.readTree(output.resolve("space-bom-report.json").toFile()); }

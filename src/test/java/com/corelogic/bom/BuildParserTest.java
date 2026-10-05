@@ -191,7 +191,7 @@ public class BuildParserTest {
     }
 
     @Test
-    public void reportsMissingVersionsAndDynamicVersions() {
+    public void reportsDynamicVersionsWhileRetainingVersionlessCoordinates() {
         var result = parser.parse("fixture", Map.of("build.gradle", """
                 dependencies {
                     implementation 'synthetic:missing'
@@ -202,6 +202,121 @@ public class BuildParserTest {
         assertEquals(3, result.dependencies().size());
         assertEquals(1, result.errors().size());
         assertFalse(result.errors().toString().contains("unknownVersion"));
+    }
+
+    @Test
+    public void acceptsVersionlessGradleDependenciesAsManagedCandidates() {
+        var result = parser.parse("fixture", Map.of("build.gradle", """
+                dependencies {
+                    implementation 'synthetic:managed'
+                    implementation(group: 'synthetic', name: 'mapped')
+                }
+                """));
+        assertEquals(2, result.dependencies().size());
+        assertNull(result.dependencies().get(0).version());
+        assertNull(result.dependencies().get(1).version());
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+    }
+
+    @Test
+    public void rejectsMismatchedLocalParentCoordinates() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom(
+                "<dependencyManagement><dependencies>" + dependency("library", "<version>2</version>")
+                        + "</dependencies></dependencyManagement>"),
+                "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>different-parent</artifactId>
+                <version>1</version></parent><artifactId>child</artifactId><dependencies>
+                <dependency><groupId>synthetic</groupId><artifactId>library</artifactId></dependency>
+                </dependencies></project>
+                """));
+        assertTrue(result.errors().toString().contains("relative parent coordinates do not match"));
+        assertNull(result.dependencies().stream().filter(d -> d.path().equals("child/pom.xml")).findFirst().orElseThrow().version());
+    }
+
+    @Test
+    public void inheritsRuntimeDependenciesAndResolvesParentAliases() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom(
+                "<dependencies>" + dependency("runtime-library", "<version>2</version><scope>runtime</scope>")
+                        + "</dependencies>"), "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId><version>1</version>
+                </parent><artifactId>child</artifactId><dependencies><dependency>
+                <groupId>${parent.groupId}</groupId><artifactId>own</artifactId>
+                <version>${pom.parent.version}</version></dependency></dependencies></project>
+                """));
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+        var child = result.dependencies().stream().filter(d -> d.path().equals("child/pom.xml")).toList();
+        assertEquals(2, child.size());
+        assertEquals("runtime", child.get(0).scope());
+        assertEquals("1", child.get(1).version());
+        assertEquals("synthetic", child.get(1).groupId());
+    }
+
+    @Test
+    public void childDependencyOverridesInheritedDependency() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom(
+                "<dependencies>" + dependency("runtime-library", "<version>2</version><scope>runtime</scope>")
+                        + "</dependencies>"), "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId><version>1</version>
+                </parent><artifactId>child</artifactId><dependencies><dependency>
+                <groupId>synthetic</groupId><artifactId>runtime-library</artifactId>
+                <version>3</version><scope>test</scope></dependency></dependencies></project>
+                """));
+        var child = result.dependencies().stream().filter(d -> d.path().equals("child/pom.xml")).toList();
+        assertEquals(1, child.size());
+        assertEquals("3", child.get(0).version());
+        assertEquals("test", child.get(0).scope());
+    }
+
+    @Test
+    public void retainsEveryDirectDeclarationVersionDespiteInheritanceOverride() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom("<dependencies>"
+                + dependency("library", "<version>1</version>") + "</dependencies>"),
+                "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId><version>1</version>
+                </parent><artifactId>child</artifactId><dependencies>
+                <dependency><groupId>synthetic</groupId><artifactId>library</artifactId><version>2</version></dependency>
+                <dependency><groupId>synthetic</groupId><artifactId>library</artifactId><version>3</version></dependency>
+                </dependencies></project>
+                """));
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+        assertEquals(java.util.List.of("2", "3"), result.dependencies().stream()
+                .filter(d -> d.path().equals("child/pom.xml")).map(BuildParser.Dependency::version).toList());
+    }
+
+    @Test
+    public void reevaluatesInheritedDependencyPropertiesInChildContext() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom(
+                "<properties><lib.version>1</lib.version></properties><dependencies>"
+                        + dependency("library", "<version>${lib.version}</version><scope>runtime</scope>")
+                        + "</dependencies>"), "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId><version>1</version>
+                </parent><artifactId>child</artifactId><properties><lib.version>2</lib.version></properties></project>
+                """));
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+        var child = result.dependencies().stream().filter(d -> d.path().equals("child/pom.xml")).findFirst().orElseThrow();
+        assertEquals("2", child.version());
+        assertEquals("runtime", child.scope());
+    }
+
+    @Test
+    public void reevaluatesManagedPropertiesAndMatchesClassifierIdentity() {
+        String parent = pom("<properties><lib.version>1</lib.version></properties>"
+                + "<dependencyManagement><dependencies>"
+                + dependency("library", "<version>${lib.version}</version>")
+                + dependency("library", "<version>7</version><type>test-jar</type><classifier>tests</classifier>")
+                + "</dependencies></dependencyManagement>");
+        var result = parser.parse("fixture", Map.of("pom.xml", parent, "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId><version>1</version>
+                </parent><artifactId>child</artifactId><properties><lib.version>2</lib.version></properties>
+                <dependencies>
+                <dependency><groupId>synthetic</groupId><artifactId>library</artifactId></dependency>
+                <dependency><groupId>synthetic</groupId><artifactId>library</artifactId>
+                <type>test-jar</type><classifier>tests</classifier></dependency>
+                </dependencies></project>
+                """));
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+        assertEquals(java.util.List.of("2", "7"), result.dependencies().stream()
+                .filter(d -> d.path().equals("child/pom.xml")).map(BuildParser.Dependency::version).toList());
     }
 
     @Test

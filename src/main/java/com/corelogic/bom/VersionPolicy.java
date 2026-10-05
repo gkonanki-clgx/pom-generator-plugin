@@ -31,7 +31,8 @@ import java.util.regex.Pattern;
 
 /** Uses Maven's effective model builder; approvals are exact releases, not inferred compatibility. */
 public final class VersionPolicy {
-    private static final Pattern STABLE = Pattern.compile("[0-9]+(?:\\.[0-9]+)*(?:[.-](?:Final|RELEASE|GA))?", Pattern.CASE_INSENSITIVE);
+    private static final Pattern STABLE = Pattern.compile(
+            "[0-9]+(?:\\.[0-9]+)*(?:[.-](?:Final|RELEASE|GA|jre[0-9]*|android))?", Pattern.CASE_INSENSITIVE);
     private final RepositorySystem system;
     private final RepositorySystemSession session;
     private final List<RemoteRepository> repositories;

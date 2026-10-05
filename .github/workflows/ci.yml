@@ -16,6 +16,16 @@ jobs:
         with:
           distribution: temurin
           java-version: '25'
+      - name: Install Maven 3.9.16
+        shell: bash
+        run: |
+          mkdir -p .ci-tools
+          base=https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.16/apache-maven-3.9.16-bin.tar.gz
+          curl --fail --silent --show-error --location "$base" -o .ci-tools/maven.tar.gz
+          curl --fail --silent --show-error --location "$base.sha512" -o .ci-tools/maven.tar.gz.sha512
+          echo "$(cat .ci-tools/maven.tar.gz.sha512)  .ci-tools/maven.tar.gz" | sha512sum --check
+          tar -xzf .ci-tools/maven.tar.gz -C .ci-tools
+          echo "$GITHUB_WORKSPACE/.ci-tools/apache-maven-3.9.16/bin" >> "$GITHUB_PATH"
       - name: Verify runtime and synthetic integration tests
         run: |
           java -version

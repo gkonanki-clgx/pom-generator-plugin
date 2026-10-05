@@ -5,6 +5,7 @@ import java.security.MessageDigest
 import java.util.jar.JarOutputStream
 
 assert Runtime.version().feature() == 25
+assert new File(basedir, 'standalone').mkdirs()
 def digest = { text ->
     MessageDigest.getInstance('SHA-256').digest(text.getBytes('UTF-8')).encodeHex().toString()
 }

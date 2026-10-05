@@ -1,6 +1,7 @@
 package com.corelogic.bom;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -174,7 +175,8 @@ public final class GenerateBomMojo extends AbstractMojo {
             report.put("dependencies", observations);
             report.put("errors", errors);
             report.put("staticExtractionLimitations", "Arbitrary build code and activated profiles cannot be fully modeled");
-            BomWriter.write(reportFile, new ObjectMapper().writerWithDefaultPrettyPrinter().writeValueAsString(report) + "\n", overwrite);
+            BomWriter.write(reportFile, new ObjectMapper().enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
+                    .writerWithDefaultPrettyPrinter().writeValueAsString(report) + "\n", overwrite);
             if (strict && !errors.isEmpty()) {
                 throw new MojoExecutionException("BOM not generated: incomplete scan/parsing/version selection; review local diagnostic report at "
                         + reportFile + " (contains private metadata; do not publish)");

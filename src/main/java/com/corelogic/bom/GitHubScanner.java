@@ -113,7 +113,7 @@ public class GitHubScanner {
         String index = digest(base + "\n" + organization + "\n" + space + "\n"
                 + excludeArchived + "\n" + excludeForks + "\n" + maxFileBytes) + ".index";
         if (offline) {
-            return readOffline(index, state);
+            return readOffline(index, state, space);
         }
         Map<String, Map<String, String>> repositories = new LinkedHashMap<>();
         Map<String, String> objects = new LinkedHashMap<>();
@@ -136,7 +136,8 @@ public class GitHubScanner {
                         throw new SafeFailure("Repository limit exceeded");
                     }
                     String name = repo.path("name").asText();
-                    if (!name.startsWith(space) || !seen.add(name)
+                    if (!matchesSpace(name, space)
+                            || !seen.add(name)
                             || (excludeArchived && repo.path("archived").asBoolean())
                             || (excludeForks && repo.path("fork").asBoolean())) {
                         continue;
@@ -151,10 +152,10 @@ public class GitHubScanner {
                                 + segment(branch)), state).json.path("sha").asText());
                         String object = digest(base + "\n" + organization + "\n" + name + "\n"
                                 + commit + "\n" + maxFileBytes) + ".json";
-                        Map<String, String> files = readCachedFiles(object, state);
+                        Map<String, String> files = readCachedFiles(object, state, name);
                         if (files == null) {
                             int priorErrors = state.errorCount;
-                            files = readRepository(repoPath, commit, state);
+                            files = readRepository(repoPath, commit, state, name);
                             // A partial scan must not become a permanent immutable cache hit.
                             if (state.errorCount == priorErrors && writeCache(object, JSON.valueToTree(files), false, state)) {
                                 objects.put(name, object);
@@ -164,7 +165,7 @@ public class GitHubScanner {
                         }
                         repositories.put(name, files);
                     } catch (SafeFailure e) {
-                        state.error(e.getMessage());
+                        fileError(state, name, null, e.getMessage());
                         if (e.authentication) {
                             throw e;
                         }
@@ -181,7 +182,7 @@ public class GitHubScanner {
         return new Scan(repositories, state.errors);
     }
 
-    private Map<String, String> readRepository(String repo, String commit, State state) throws Exception {
+    private Map<String, String> readRepository(String repo, String commit, State state, String name) throws Exception {
         JsonNode tree = request(endpoint(repo + "/git/trees/" + commit + "?recursive=1"), state).json;
         List<Blob> blobs = new ArrayList<>();
         if (tree.path("truncated").asBoolean()) {
@@ -207,7 +208,7 @@ public class GitHubScanner {
                 throw new SafeFailure("Build file limit exceeded");
             }
             if (blob.size > maxFileBytes) {
-                state.error("Build file exceeds configured size limit");
+                fileError(state, name, blob.path, "Build file exceeds configured size limit");
                 continue;
             }
             try {
@@ -240,11 +241,14 @@ public class GitHubScanner {
                     throw new SafeFailure("Build file is not valid UTF-8");
                 }
             } catch (SafeFailure e) {
-                state.error(e.getMessage());
+                fileError(state, name, blob.path, e.getMessage());
                 if (e.authentication || state.bytes > MAX_TOTAL_BYTES) {
                     throw e;
                 }
             }
+        }
+        if (!hasBuildDescriptor(files)) {
+            fileError(state, name, null, "No supported build files found");
         }
         return files;
     }
@@ -307,6 +311,14 @@ public class GitHubScanner {
                 continue;
             }
             int status = response.statusCode();
+            if (status == 403 && (response.headers().firstValue("X-RateLimit-Remaining").orElse("").equals("0")
+                    || response.headers().firstValue("Retry-After").isPresent())) {
+                if (attempt < 2) {
+                    pause(attempt, state, response);
+                    continue;
+                }
+                throw new SafeFailure("GitHub API rate limit exhausted (403)", true);
+            }
             if (status == 401 || status == 403) {
                 throw new SafeFailure(status == 401 ? "GitHub authentication failed (401)"
                         : "GitHub access denied or rate limited (403)", true);
@@ -319,7 +331,7 @@ public class GitHubScanner {
             }
             if (status == 429 || status == 502 || status == 503 || status == 504) {
                 if (attempt < 2) {
-                    pause(attempt, state);
+                    pause(attempt, state, response);
                     continue;
                 }
                 throw new SafeFailure("GitHub API temporarily unavailable");
@@ -341,10 +353,24 @@ public class GitHubScanner {
     }
 
     private static void pause(int attempt, State state) throws InterruptedException, SafeFailure {
+        pause(attempt, state, null);
+    }
+
+    private static void pause(int attempt, State state, HttpResponse<?> response)
+            throws InterruptedException, SafeFailure {
         if (System.nanoTime() >= state.deadline) {
             throw new SafeFailure("GitHub scan time limit exceeded");
         }
-        Thread.sleep(100L * (attempt + 1));
+        long wait = 100L * (attempt + 1);
+        if (response != null) {
+            String retry = response.headers().firstValue("Retry-After").orElse("");
+            try {
+                wait = Math.max(wait, Math.min(1L, Math.max(0L, Long.parseLong(retry))) * 1_000L);
+            } catch (NumberFormatException ignored) {
+                // Never trust server-controlled delays to extend the scan's time budget.
+            }
+        }
+        Thread.sleep(Math.min(wait, 1_000L));
     }
 
     private URI nextPage(String link, URI current, String listPath) throws SafeFailure {
@@ -378,6 +404,17 @@ public class GitHubScanner {
         return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
     }
 
+    private void fileError(State state, String repository, String path, String message) {
+        state.error("Repository " + label(repository) + (path == null ? "" : ", file " + label(path))
+                + ": " + message);
+    }
+
+    private String label(String value) {
+        String safe = token == null || token.isEmpty() ? value : value.replace(token, "[redacted]");
+        safe = safe.replaceAll("[\\p{Cntrl}]", "?");
+        return safe.length() > 256 ? safe.substring(0, 256) + "..." : safe;
+    }
+
     private static String checkedSha(String value) throws SafeFailure {
         if (!SHA.matcher(value).matches()) {
             throw new SafeFailure("Invalid immutable Git object identifier");
@@ -388,6 +425,17 @@ public class GitHubScanner {
     private static boolean relevant(String path) {
         String name = path.substring(path.lastIndexOf('/') + 1);
         return BUILD_FILES.contains(name) || name.endsWith(".toml");
+    }
+
+    private static boolean hasBuildDescriptor(Map<String, String> files) {
+        return files.keySet().stream().anyMatch(path -> {
+            String name = path.substring(path.lastIndexOf('/') + 1);
+            return name.equals("pom.xml") || name.equals("build.gradle") || name.equals("build.gradle.kts");
+        });
+    }
+
+    private static boolean matchesSpace(String name, String space) {
+        return name.equals(space) || name.startsWith(space + "-") || name.startsWith(space + "_");
     }
 
     private static boolean safePath(String path) {
@@ -407,7 +455,7 @@ public class GitHubScanner {
                 MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)));
     }
 
-    private Scan readOffline(String index, State state) {
+    private Scan readOffline(String index, State state, String space) {
         Map<String, Map<String, String>> repositories = new LinkedHashMap<>();
         try {
             JsonNode node = cacheNode(index);
@@ -417,11 +465,14 @@ public class GitHubScanner {
             var fields = node.fields();
             while (fields.hasNext()) {
                 var entry = fields.next();
+                if (!matchesSpace(entry.getKey(), space)) {
+                    continue;
+                }
                 String object = entry.getValue().asText();
                 if (!object.matches("[0-9a-f]{64}\\.json")) {
                     throw new IOException();
                 }
-                Map<String, String> files = readCachedFiles(object, state);
+                Map<String, String> files = readCachedFiles(object, state, entry.getKey());
                 if (files == null) {
                     throw new IOException();
                 }
@@ -433,7 +484,7 @@ public class GitHubScanner {
         return new Scan(repositories, state.errors);
     }
 
-    private Map<String, String> readCachedFiles(String object, State state) throws SafeFailure {
+    private Map<String, String> readCachedFiles(String object, State state, String repository) throws SafeFailure {
         if (cacheDirectory == null) {
             return null;
         }
@@ -455,16 +506,19 @@ public class GitHubScanner {
                 String text = entry.getValue().asText();
                 int bytes = text.getBytes(StandardCharsets.UTF_8).length;
                 if (bytes > maxFileBytes || ++state.files > MAX_FILES) {
-                    throw new SafeFailure("Cached build file exceeds configured limits");
+                    throw new SafeFailure("Cached build file exceeds configured limits: " + label(entry.getKey()));
                 }
                 state.addBytes(bytes);
                 files.put(entry.getKey(), text);
+            }
+            if (!hasBuildDescriptor(files)) {
+                fileError(state, repository, null, "No supported build files found");
             }
             return files;
         } catch (SafeFailure e) {
             throw e;
         } catch (Exception e) {
-            state.error("Private cache unavailable or invalid");
+            fileError(state, repository, null, "Private cache unavailable or invalid");
             return null;
         }
     }

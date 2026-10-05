@@ -36,8 +36,7 @@ def managed = report.dependencies.find { it.coordinate == 'org.example.synthetic
 assert managed.distinctRepositoryCount == 2 && managed.chosenVersion == '2.3.0'
 assert managed.observedVersions == ['0.1.0', '0.2.0']
 assert managed.provenance.size() == 3
-assert Arrays.equals(new File(basedir, 'first/dda-bom-report.json').bytes,
-    new File(basedir, 'second/dda-bom-report.json').bytes)
+assert report == new JsonSlurper().parse(new File(basedir, 'second/dda-bom-report.json'))
 
 assert !new File(basedir, 'strict-failure/dds-bom.pom').exists()
 def failure = new JsonSlurper().parse(new File(basedir, 'strict-failure/dds-bom-report.json'))

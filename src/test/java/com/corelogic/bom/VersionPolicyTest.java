@@ -23,7 +23,11 @@ public class VersionPolicyTest {
         assertEquals("1.10.0", VersionPolicy.newestStable(List.of("1.9.0", "1.10.0", "2.0.0-RC1",
                 "2.0.0-M1", "2.0.0-beta", "3.0.0-SNAPSHOT", "4.0.0-alpha")));
         assertTrue(VersionPolicy.stable("1.0.0.Final"));
+        assertTrue(VersionPolicy.stable("33.5.0-jre"));
+        assertTrue(VersionPolicy.stable("12.8.1.jre11"));
+        assertTrue(VersionPolicy.stable("33.5.0-android"));
         assertFalse(VersionPolicy.stable("[1,2)"));
+        assertFalse(VersionPolicy.stable("1.0.0-custom"));
     }
 
     @Test public void effectiveBootModelIncludesParentPropertiesAndImportedBom() throws Exception {

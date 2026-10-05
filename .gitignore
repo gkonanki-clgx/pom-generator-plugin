@@ -1,4 +1,5 @@
 /target/
+/.ci-tools/
 /bom-output/
 /.bom-cache/
 *-bom.pom

@@ -24,6 +24,7 @@ import org.xml.sax.helpers.DefaultHandler;
  * custom expressions, and non-inline TOML library tables are reported as incomplete.
  * Buildscript classpath dependencies are excluded, like Maven plugin dependencies.
  * Only literal Gradle assignments and gradle.properties interpolation are supported.
+ * Versionless Gradle coordinates are retained for downstream dependency management.
  */
 public class BuildParser {
     public record Dependency(String groupId, String artifactId, String version, String type,
@@ -75,6 +76,8 @@ public class BuildParser {
     private static class MavenModel {
         final Map<String, String> properties = new HashMap<>();
         final Map<String, Dependency> managed = new HashMap<>();
+        final Map<String, Element> managedDeclarations = new LinkedHashMap<>();
+        final List<Element> declarations = new ArrayList<>();
         final List<Dependency> dependencies = new ArrayList<>();
     }
 
@@ -102,26 +105,48 @@ public class BuildParser {
             builder.setErrorHandler(new DefaultHandler());
             Element project = builder.parse(new InputSource(new StringReader(files.get(path)))).getDocumentElement();
             if (!name(project).equals("project")) throw new IllegalArgumentException();
+            Map<String, String> ownProperties = new HashMap<>();
+            Element props = child(project, "properties");
+            if (props != null) for (Element property : children(props)) {
+                ownProperties.put(name(property), property.getTextContent().trim());
+            }
             Element parent = child(project, "parent");
+            List<Element> inheritedDeclarations = new ArrayList<>();
             if (parent != null) {
                 String relative = value(parent, "relativePath");
                 if (relative == null) relative = "../pom.xml";
                 String parentPath = resolvePath(path, relative);
+                if (!files.containsKey(parentPath) && files.containsKey(normalize(parentPath + "/pom.xml"))) {
+                    parentPath = normalize(parentPath + "/pom.xml");
+                }
                 if (!relative.isEmpty() && files.containsKey(parentPath)) {
                     MavenModel inherited = maven(repo, parentPath, files, cache, visiting, errors);
-                    model.properties.putAll(inherited.properties);
-                    model.managed.putAll(inherited.managed);
+                    Map<String, String> comparisonProperties = new HashMap<>(inherited.properties);
+                    comparisonProperties.putAll(ownProperties);
+                    boolean matches = true;
+                    for (String coordinate : List.of("groupId", "artifactId", "version")) {
+                        String expected = expand(value(parent, coordinate), comparisonProperties);
+                        String actual = expand(inherited.properties.get("project." + coordinate), inherited.properties);
+                        if (expected != null && (!staticValue(expected) || !expected.equals(actual))) matches = false;
+                    }
+                    if (matches) {
+                        model.properties.putAll(inherited.properties);
+                        model.managed.putAll(inherited.managed);
+                        model.managedDeclarations.putAll(inherited.managedDeclarations);
+                        inheritedDeclarations.addAll(inherited.declarations);
+                    } else {
+                        error(errors, repo, path, "relative parent coordinates do not match declared parent");
+                    }
                 } else {
                     error(errors, repo, path, "external parent cannot be resolved offline");
                 }
-                put(model.properties, "project.parent.groupId", value(parent, "groupId"));
-                put(model.properties, "project.parent.artifactId", value(parent, "artifactId"));
-                put(model.properties, "project.parent.version", value(parent, "version"));
+                for (String coordinate : List.of("groupId", "artifactId", "version")) {
+                    put(model.properties, "project.parent." + coordinate, value(parent, coordinate));
+                    put(model.properties, "pom.parent." + coordinate, value(parent, coordinate));
+                    put(model.properties, "parent." + coordinate, value(parent, coordinate));
+                }
             }
-            Element props = child(project, "properties");
-            if (props != null) for (Element property : children(props)) {
-                model.properties.put(name(property), property.getTextContent().trim());
-            }
+            model.properties.putAll(ownProperties);
             for (String coordinate : List.of("groupId", "artifactId", "version")) {
                 String text = value(project, coordinate);
                 if (text == null && parent != null && !coordinate.equals("artifactId")) text = value(parent, coordinate);
@@ -131,20 +156,48 @@ public class BuildParser {
                     model.properties.put(coordinate, text);
                 }
             }
+            // Retain declarations, not materialized values, so child property overrides apply.
+            Map<String, Element> inheritedManagement = new LinkedHashMap<>(model.managedDeclarations);
+            model.managedDeclarations.clear();
+            model.managed.clear();
+            for (Element dep : inheritedManagement.values()) {
+                Dependency dependency = mavenDependency(repo, path, dep, model, true, errors);
+                if (dependency != null) {
+                    model.managed.put(dependency.key(), dependency);
+                    model.managedDeclarations.put(dependency.key(), dep);
+                }
+            }
             Element management = child(project, "dependencyManagement");
             if (management != null) {
                 for (Element dep : children(child(management, "dependencies"), "dependency")) {
                     Dependency dependency = mavenDependency(repo, path, dep, model, true, errors);
                     if (dependency != null) {
                         model.managed.put(dependency.key(), dependency);
+                        model.managedDeclarations.put(dependency.key(), dep);
                         model.dependencies.add(dependency);
                     }
                 }
             }
+            List<Dependency> directDependencies = new ArrayList<>();
+            List<Element> directDeclarations = new ArrayList<>();
+            Set<String> directKeys = new LinkedHashSet<>();
             for (Element dep : children(child(project, "dependencies"), "dependency")) {
                 Dependency dependency = mavenDependency(repo, path, dep, model, false, errors);
-                if (dependency != null) model.dependencies.add(dependency);
+                if (dependency != null) {
+                    directDependencies.add(dependency);
+                    directDeclarations.add(dep);
+                    directKeys.add(dependency.key());
+                }
             }
+            for (Element dep : inheritedDeclarations) {
+                Dependency dependency = mavenDependency(repo, path, dep, model, false, errors);
+                if (dependency != null && !directKeys.contains(dependency.key())) {
+                    model.dependencies.add(dependency);
+                    model.declarations.add(dep);
+                }
+            }
+            model.dependencies.addAll(directDependencies);
+            model.declarations.addAll(directDeclarations);
             if (!children(child(project, "profiles")).isEmpty()) {
                 error(errors, repo, path, "profile-dependent dependencies are incomplete");
             }
@@ -167,7 +220,7 @@ public class BuildParser {
         String classifier = expand(value(element, "classifier"), model.properties);
         String scope = expand(value(element, "scope"), model.properties);
         String optional = expand(value(element, "optional"), model.properties);
-        if (type == null) type = "jar";
+        if (type == null || type.isBlank()) type = "jar";
         if (classifier == null) classifier = "";
         if (!staticValue(group) || !staticValue(artifact)) {
             error(errors, repo, path, "unresolved dependency coordinates or properties");
@@ -388,7 +441,7 @@ public class BuildParser {
             error(errors, repo, path, "unresolved dependency coordinates or properties");
             return;
         }
-        if (version == null || !staticValue(version) || dynamicVersion(version)
+        if ((version != null && (!staticValue(version) || dynamicVersion(version)))
                 || !staticValue(type) || classifier.contains("$")) {
             error(errors, repo, path, "unresolved or dynamic dependency version or metadata");
         }
