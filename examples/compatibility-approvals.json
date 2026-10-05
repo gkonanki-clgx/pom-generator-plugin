@@ -1,0 +1,14 @@
+{
+  "springBootVersion": "4.1.1",
+  "javaRelease": 25,
+  "approvals": [
+    {
+      "groupId": "org.example.synthetic",
+      "artifactId": "library",
+      "type": "jar",
+      "classifier": "",
+      "versions": ["1.9.0", "1.10.0"],
+      "evidence": "Synthetic example only; replace with recorded approval for Boot/JDK"
+    }
+  ]
+}

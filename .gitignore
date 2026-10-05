@@ -1,0 +1,5 @@
+/target/
+/bom-output/
+/.bom-cache/
+*-bom.pom
+*-bom-report.json
