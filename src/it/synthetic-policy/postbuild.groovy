@@ -5,7 +5,26 @@ import javax.xml.xpath.XPathConstants
 
 def first = new File(basedir, 'first/dda-bom.pom')
 def second = new File(basedir, 'second/dda-bom.pom')
-assert first.isFile() && second.isFile()
+if (!first.isFile() || !second.isFile()) {
+    // Summarize only fixed, non-identifying diagnostics; never echo report contents or paths.
+    def generic = ['Offline cache unavailable or incomplete', 'Private cache unavailable',
+        'No repositories successfully scanned for selected prefix',
+        'GitHub discovery failed; check API destination, credentials/access, rate limits and cache']
+    def context = ['first', 'second'].collect { run ->
+        def bom = new File(basedir, "${run}/dda-bom.pom").isFile() ? 'present' : 'missing'
+        def reportFile = new File(basedir, "${run}/dda-bom-report.json")
+        if (!reportFile.isFile()) {
+            return "${run}: BOM ${bom}, no diagnostic report"
+        }
+        def errors = new JsonSlurper().parse(reportFile).errors ?: []
+        def known = errors.findAll { it in generic }
+        def policy = errors.count { it.startsWith('Version policy initialization failed') }
+        "${run}: BOM ${bom}, ${errors.size()} report error(s); generic=${known}, " +
+            "versionPolicyInitialization=${policy}, other=${errors.size() - known.size() - policy}"
+    }
+    assert false: 'Expected dda BOM output from both generate-bom invocations; strict generation refused output. ' +
+        'Inspect build.log and the local report privately. ' + context.join('; ')
+}
 assert Arrays.equals(first.bytes, second.bytes): 'BOM output must be byte-identical across repeated invocation'
 def factory = DocumentBuilderFactory.newInstance()
 factory.setFeature('http://apache.org/xml/features/disallow-doctype-decl', true)

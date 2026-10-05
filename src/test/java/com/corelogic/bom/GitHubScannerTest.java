@@ -21,6 +21,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import static org.junit.Assert.*;
+import static org.junit.Assume.assumeNoException;
 import static org.junit.Assume.assumeTrue;
 
 public class GitHubScannerTest {
@@ -431,18 +432,23 @@ public class GitHubScannerTest {
 
     @Test
     public void privateImmutableCacheSupportsOfflineAndReusesCommitObjects() throws Exception {
-        assumeTrue("Requires POSIX filesystem permissions",
-                Path.of("target").getFileSystem().supportedFileAttributeViews().contains("posix"));
+        assumeTrue("Requires POSIX permissions or ACLs", PrivateFilesTest.privateCapable());
         Files.createDirectories(Path.of("target"));
         cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
         route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
         repository("space-project", "main", List.of(blobEntry("module/pom.xml")));
         GitHubScanner.Scan online = scanner(false, 4096).scan("acme", "space");
         assertTrue(online.errors().toString(), online.errors().isEmpty());
-        assertEquals(PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(cache));
+        PrivateFiles.checkDirectory(cache);
+        if (PrivateFilesTest.posix()) {
+            assertEquals(PosixFilePermissions.fromString("rwx------"), Files.getPosixFilePermissions(cache));
+        }
         try (var files = Files.list(cache)) {
             for (Path file : files.toList()) {
-                assertEquals(PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(file));
+                PrivateFiles.checkFile(file);
+                if (PrivateFilesTest.posix()) {
+                    assertEquals(PosixFilePermissions.fromString("rw-------"), Files.getPosixFilePermissions(file));
+                }
                 assertFalse(Files.readString(file).contains(TOKEN));
             }
         }
@@ -467,12 +473,11 @@ public class GitHubScannerTest {
 
     @Test
     public void doesNotPopulatePublicCacheDirectoryOrCachePartialResults() throws Exception {
-        assumeTrue("Requires POSIX filesystem permissions",
-                Path.of("target").getFileSystem().supportedFileAttributeViews().contains("posix"));
+        assumeTrue("Requires POSIX permissions or ACLs", PrivateFilesTest.privateCapable());
         Files.createDirectories(Path.of("target"));
         cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
-        Files.createDirectory(cache);
-        Files.setPosixFilePermissions(cache, PosixFilePermissions.fromString("rwxr-xr-x"));
+        PrivateFiles.createDirectories(cache);
+        PrivateFilesTest.broaden(cache);
         route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
         repository("space-project", "main", List.of(blobEntry("pom.xml")));
         GitHubScanner.Scan result = scanner(false, 4096).scan("acme", "space");
@@ -481,7 +486,12 @@ public class GitHubScannerTest {
         try (var files = Files.list(cache)) {
             assertEquals(0, files.count());
         }
-        Files.setPosixFilePermissions(cache, PosixFilePermissions.fromString("rwx------"));
+        if (PrivateFilesTest.posix()) {
+            Files.setPosixFilePermissions(cache, PosixFilePermissions.fromString("rwx------"));
+        } else {
+            Files.delete(cache);
+            PrivateFiles.createDirectories(cache);
+        }
         blob("/repos/acme/space-project", new byte[] {(byte) 0xff});
         assertFalse(scanner(false, 4096).scan("acme", "space").errors().isEmpty());
         assertFalse(scanner(true, 4096).scan("acme", "space").errors().isEmpty());
@@ -489,13 +499,16 @@ public class GitHubScannerTest {
 
     @Test
     public void refusesSymlinkCachePaths() throws Exception {
-        assumeTrue("Requires POSIX filesystem permissions",
-                Path.of("target").getFileSystem().supportedFileAttributeViews().contains("posix"));
+        assumeTrue("Requires POSIX permissions or ACLs", PrivateFilesTest.privateCapable());
         Files.createDirectories(Path.of("target"));
         cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
-        Files.createDirectory(cache, PosixFilePermissions.asFileAttribute(
-                PosixFilePermissions.fromString("rwx------")));
-        Path link = Files.createSymbolicLink(cache.resolve("link"), Path.of("."));
+        PrivateFiles.createDirectories(cache);
+        Path link = cache.resolve("link");
+        try {
+            Files.createSymbolicLink(link, Path.of("."));
+        } catch (UnsupportedOperationException | IOException | SecurityException e) {
+            assumeNoException("Symbolic links unavailable", e);
+        }
         route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
         repository("space-project", "main", List.of(blobEntry("pom.xml")));
         GitHubScanner.Scan result = new GitHubScanner(base, null, TOKEN,
@@ -504,6 +517,86 @@ public class GitHubScannerTest {
         assertEquals("source", result.repositories().get("space-project").get("pom.xml"));
         try (var files = Files.list(cache)) {
             assertEquals(List.of(link), files.toList());
+        }
+    }
+
+    private List<Path> populateCache() throws Exception {
+        Files.createDirectories(Path.of("target"));
+        cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
+        route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
+        repository("space-project", "main", List.of(blobEntry("pom.xml")));
+        GitHubScanner.Scan online = scanner(false, 4096).scan("acme", "space");
+        assertTrue(online.errors().toString(), online.errors().isEmpty());
+        assertTrue(scanner(true, 4096).scan("acme", "space").errors().isEmpty());
+        try (var files = Files.list(cache)) {
+            return files.sorted().toList();
+        }
+    }
+
+    @Test
+    public void offlineRefusesBroadenedCacheFilesAndDirectory() throws Exception {
+        assumeTrue("Requires POSIX permissions or ACLs", PrivateFilesTest.privateCapable());
+        for (Path file : populateCache()) {
+            byte[] contents = Files.readAllBytes(file);
+            PrivateFilesTest.broaden(file);
+            GitHubScanner.Scan result = scanner(true, 4096).scan("acme", "space");
+            assertTrue(result.errors().contains("Offline cache unavailable or incomplete"));
+            assertFalse(result.errors().toString().contains(cache.toString()));
+            Files.delete(file);
+            PrivateFiles.createFile(file);
+            Files.write(file, contents);
+            assertTrue(scanner(true, 4096).scan("acme", "space").errors().isEmpty());
+        }
+        PrivateFilesTest.broaden(cache);
+        assertEquals(List.of("Offline cache unavailable or incomplete"),
+                scanner(true, 4096).scan("acme", "space").errors());
+    }
+
+    @Test
+    public void offlineRefusesSymlinkCacheFiles() throws Exception {
+        assumeTrue("Requires POSIX permissions or ACLs", PrivateFilesTest.privateCapable());
+        for (Path file : populateCache()) {
+            Path moved = cache.resolve("moved-" + file.getFileName());
+            Files.move(file, moved);
+            try {
+                Files.createSymbolicLink(file, moved.getFileName());
+            } catch (UnsupportedOperationException | IOException | SecurityException e) {
+                assumeNoException("Symbolic links unavailable", e);
+            }
+            assertTrue(scanner(true, 4096).scan("acme", "space").errors()
+                    .contains("Offline cache unavailable or incomplete"));
+            Files.delete(file);
+            Files.move(moved, file);
+        }
+        assertTrue(scanner(true, 4096).scan("acme", "space").errors().isEmpty());
+    }
+
+    @Test
+    public void cacheOnStoreWithoutPrivatePermissionsFailsClosed() throws Exception {
+        Files.createDirectories(Path.of("target"));
+        Path archive = Path.of("target", "github-scanner-store-" + UUID.randomUUID() + ".zip");
+        try (var store = java.nio.file.FileSystems.newFileSystem(archive, Map.of("create", "true"))) {
+            Path readable = Files.createDirectory(store.getPath("/cache"));
+            if (PrivateFilesTest.privateCapable()) {
+                for (Path file : populateCache()) {
+                    Files.copy(file, readable.resolve(file.getFileName().toString()));
+                }
+            }
+            GitHubScanner.Scan offline = new GitHubScanner(base, null, null,
+                    true, true, 4096, true, readable).scan("acme", "space");
+            assertEquals(List.of("Offline cache unavailable or incomplete"), offline.errors());
+            assertTrue(offline.repositories().isEmpty());
+
+            route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
+            repository("space-project", "main", List.of(blobEntry("pom.xml")));
+            Path writable = store.getPath("/new-cache");
+            GitHubScanner.Scan online = new GitHubScanner(base, null, TOKEN,
+                    true, true, 4096, false, writable).scan("acme", "space");
+            assertEquals(List.of("Private cache unavailable"), online.errors());
+            assertEquals("source", online.repositories().get("space-project").get("pom.xml"));
+            assertFalse(Files.exists(writable));
+        } finally {
+            Files.deleteIfExists(archive);
         }
     }
 
