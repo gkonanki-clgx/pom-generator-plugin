@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+          http://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <!-- =====================================================
+       GitHub Packages Authentication
+       ===================================================== -->
+  
+  <servers>
+    <!-- GitHub Packages server for plugin repository -->
+    <server>
+      <id>github</id>
+      <username>YOUR_GITHUB_USERNAME</username>
+      <!-- Generate PAT at: https://github.com/settings/tokens/new
+           Scopes: read:org, read:packages
+           Either:
+           (A) Use plaintext token for development:
+               <password>ghp_xxxxxxxxxxxxxxxxxxxx</password>
+           
+           (B) Use Maven encrypted password for production:
+               1. Generate encrypted password:
+                  mvn -ep "ghp_xxxxxxxxxxxxxxxxxxxx"
+               2. Copy encrypted output:
+                  {xxxxx...} or DESede:xxxxx...
+               3. Paste encrypted value:
+               <password>{DESede:xxxxx...}</password>
+               4. Create ~/.m2/settings-security.xml with master key
+      -->
+      <password>ghp_xxxxxxxxxxxxxxxxxxxx</password>
+    </server>
+
+    <!-- Optional: Private Maven repository (for company artifacts) -->
+    <server>
+      <id>private-artifacts</id>
+      <username>artifact-reader</username>
+      <password>{YOUR_ENCRYPTED_ARTIFACT_PASSWORD}</password>
+    </server>
+  </servers>
+
+  <!-- =====================================================
+       Repository Configuration
+       ===================================================== -->
+  
+  <mirrors>
+    <!-- Optional: Route GitHub package requests through mirror -->
+    <mirror>
+      <id>github-packages</id>
+      <mirrorOf>github</mirrorOf>
+      <url>https://maven.pkg.github.com/gkonanki-clgx/pom-generator-plugin</url>
+    </mirror>
+  </mirrors>
+
+  <!-- =====================================================
+       Profiles
+       ===================================================== -->
+  
+  <profiles>
+    <!-- Profile for GitHub Packages plugin repository -->
+    <profile>
+      <id>github-packages</id>
+      <activation>
+        <!-- Auto-activate this profile (optional) -->
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      
+      <pluginRepositories>
+        <pluginRepository>
+          <id>github</id>
+          <name>GitHub Packages</name>
+          <url>https://maven.pkg.github.com/gkonanki-clgx/pom-generator-plugin</url>
+          <snapshots>
+            <enabled>true</enabled>
+            <updatePolicy>always</updatePolicy>
+          </snapshots>
+          <releases>
+            <enabled>true</enabled>
+            <updatePolicy>daily</updatePolicy>
+          </releases>
+        </pluginRepository>
+      </pluginRepositories>
+    </profile>
+
+    <!-- Profile for private company artifacts (if needed) -->
+    <profile>
+      <id>private-artifacts</id>
+      <activation>
+        <activeByDefault>false</activeByDefault>
+      </activation>
+      
+      <repositories>
+        <repository>
+          <id>private-artifacts</id>
+          <name>Private Company Artifacts</name>
+          <url>https://maven.example.invalid/repository/releases</url>
+          <releases>
+            <enabled>true</enabled>
+            <updatePolicy>daily</updatePolicy>
+            <checksumPolicy>warn</checksumPolicy>
+          </releases>
+          <snapshots>
+            <enabled>false</enabled>
+          </snapshots>
+        </repository>
+      </repositories>
+    </profile>
+
+    <!-- JDK 25 Profile -->
+    <profile>
+      <id>java25</id>
+      <activation>
+        <activeByDefault>true</activeByDefault>
+      </activation>
+      
+      <properties>
+        <maven.compiler.release>25</maven.compiler.release>
+        <maven.compiler.source>25</maven.compiler.source>
+        <maven.compiler.target>25</maven.compiler.target>
+      </properties>
+    </profile>
+  </profiles>
+
+  <!-- =====================================================
+       Active Profiles
+       ===================================================== -->
+  
+  <activeProfiles>
+    <activeProfile>java25</activeProfile>
+    <!-- Uncomment to auto-enable GitHub Packages profile:
+    <activeProfile>github-packages</activeProfile>
+    -->
+    <!-- Uncomment to auto-enable private artifacts:
+    <activeProfile>private-artifacts</activeProfile>
+    -->
+  </activeProfiles>
+
+  <!-- =====================================================
+       Other Maven Settings
+       ===================================================== -->
+  
+  <localRepository>${user.home}/.m2/repository</localRepository>
+
+  <!-- Offline mode (set to true for offline builds) -->
+  <offline>false</offline>
+
+  <!-- Maven behavior settings -->
+  <interactiveMode>true</interactiveMode>
+  <usePluginRegistry>false</usePluginRegistry>
+
+</settings>
