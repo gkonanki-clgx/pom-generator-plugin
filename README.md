@@ -136,13 +136,21 @@ See [the synthetic schema example](examples/compatibility-approvals.json). Repla
 | `offline` | `false` | Use cached discovery and Maven artifacts only |
 | `cacheDirectory` | unset | Opt-in private GitHub scan cache |
 
-Maven `-o` also enables offline behavior. Populate the explicitly configured cache in an authorized online run before attempting offline generation; offline results reflect that snapshot, not current organization membership or contents.
+Maven `-o` also enables offline behavior. Populate the explicitly configured cache in an authorized online run before attempting offline generation; offline results reflect that snapshot, not current organization membership or contents. Offline scanning requires no GitHub token and makes no GitHub API requests. An absent/incomplete cache produces diagnostics rather than silently returning an empty successful inventory.
+
+The optional cache requires a filesystem with **POSIX permissions**: its directory must be `0700` and every cache file `0600`; symbolic-link paths are refused. Keep a dedicated private directory and do not broaden permissions or share the cache. The cache snapshot is keyed by API destination, organization, space, exclusion flags and file-size limit; use matching settings when replaying offline.
 
 ## Safety and limitations
 
 Strict mode writes a diagnostic report and fails without generating a BOM when discovery, extraction, model resolution or selected-coordinate policy is incomplete. `-Dstrict=false` permits incomplete output with unresolved entries omitted; inspect the report and do not treat it as an approved production BOM. Existing output is refused unless `-Doverwrite=true`; use a fresh directory after failed or changed runs to avoid mistaking old output for a new result.
 
+The report's `complete: true` means **no detected static scan, extraction or selected-version errors**, not full evaluation of repository builds, complete runtime dependency coverage, or application compatibility.
+
 **External Maven parents and build-file imported BOM management are not fetched by the static parser. Unresolved versions from those declarations produce diagnostics and strict generation fails.** This differs from the version policy's effective Boot BOM resolution, which does resolve trusted Maven parent/import models. Imported management declarations themselves are not occurrence evidence.
+
+Scanning is bounded: 4 MiB maximum per build file (2 MiB default), 32 MiB aggregate build metadata, 1,000 build files, 1,000 repository listing entries, 50,000 tree entries, 2,000 requests and a 120-second scan budget. API responses are capped at 8 MiB. Bounds, malformed content and incomplete/truncated discovery yield diagnostics; strict mode does not publish a partial BOM.
+
+For authentication/access diagnostics, check token expiry, organization SSO authorization and selected-repository permissions; a 404 can indicate missing access. For rate limits, wait for the service's reset and retry rather than weakening completeness checks. For cache diagnostics, verify the exact offline settings and private permissions or repopulate in an authorized online run. For artifact/model resolution diagnostics, check Maven repository configuration, independent artifact credentials and the local offline repository; unresolved unmanaged coordinates need recorded exact-version approval. Resolve unsupported extraction in reviewed source/configuration or assess the diagnostic report explicitly—do not run fetched build code to bypass the parser.
 
 The report and optional cache contain **private repository names, paths, coordinates and build content**. Keep them access-controlled and local; do not upload them as CI artifacts or commit them. The repository `.gitignore` excludes default output/cache/build paths, but a custom directory must be excluded separately. No token should appear in generated output.
 

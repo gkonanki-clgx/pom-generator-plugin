@@ -379,11 +379,53 @@ public class GitHubScannerTest {
                 Map.of("name", "space-fork", "default_branch", "main", "fork", true)));
         repository("space-archived", "main", List.of(blobEntry("pom.xml")));
         repository("space-fork", "main", List.of(blobEntry("pom.xml")));
-        GitHubScanner.Scan result = new GitHubScanner(base, null, null,
+        GitHubScanner.Scan result = new GitHubScanner(base, null, TOKEN,
                 false, false, 4096, false, null).scan("acme", "space");
         assertTrue(result.errors().isEmpty());
         assertEquals(2, result.repositories().size());
-        assertTrue(authorizations.stream().allMatch(value -> value == null));
+        assertTrue(authorizations.stream().allMatch(value -> ("Bearer " + TOKEN).equals(value)));
+    }
+
+    @Test
+    public void onlineRequiresTokenBeforeAnyHttpRequestButOfflineDoesNot() throws Exception {
+        for (String token : new String[] {null, "", "   "}) {
+            GitHubScanner.Scan result = new GitHubScanner(base, null, token,
+                    true, true, 4096, false, null).scan("acme", "space");
+            assertTrue(result.repositories().isEmpty());
+            assertEquals(List.of(
+                    "GitHub token is required for online scanning; configure authentication or use offline cache"),
+                    result.errors());
+        }
+        assertTrue(requests.isEmpty());
+        GitHubScanner.Scan offline = new GitHubScanner(base, null, null,
+                true, true, 4096, true, null).scan("acme", "space");
+        assertEquals(List.of("Offline cache unavailable or incomplete"), offline.errors());
+        assertTrue(requests.isEmpty());
+    }
+
+    @Test
+    public void symbolicLinkBuildFilesAreNeverReadAsSources() throws Exception {
+        route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
+        repository("space-project", "main", List.of(Map.of("path", "pom.xml", "type", "blob",
+                "mode", "120000", "sha", BLOB, "size", 6)));
+        GitHubScanner.Scan result = scanner(false, 4096).scan("acme", "space");
+        assertTrue(result.repositories().get("space-project").isEmpty());
+        assertTrue(result.errors().contains(
+                "Repository space-project, file pom.xml: Unsupported symbolic-link build file"));
+        assertFalse(requests.stream().anyMatch(path -> path.contains("/git/blobs/")));
+    }
+
+    @Test
+    public void submoduleEntriesReportIncompleteScanWithoutFollowingThem() throws Exception {
+        route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
+        repository("space-project", "main", List.of(blobEntry("pom.xml"),
+                Map.of("path", "vendor/module", "type", "commit", "mode", "160000", "sha", TREE)));
+        GitHubScanner.Scan result = scanner(false, 4096).scan("acme", "space");
+        assertEquals("source", result.repositories().get("space-project").get("pom.xml"));
+        assertEquals(List.of(
+                "Repository space-project, file vendor/module: Unsupported Git submodule; nested build files were not scanned"),
+                result.errors());
+        assertFalse(requests.stream().anyMatch(path -> path.contains(TREE)));
     }
 
     @Test
@@ -405,7 +447,8 @@ public class GitHubScannerTest {
         assertEquals(1L, requests.stream().filter(path -> path.contains("/git/blobs/")).count());
         int before = requests.size();
         server.stop(0);
-        GitHubScanner.Scan offline = scanner(true, 4096).scan("acme", "space");
+        GitHubScanner.Scan offline = new GitHubScanner(base, null, null,
+                true, true, 4096, true, cache).scan("acme", "space");
         assertTrue(offline.errors().isEmpty());
         assertEquals(online.repositories(), offline.repositories());
         assertEquals(before, requests.size());

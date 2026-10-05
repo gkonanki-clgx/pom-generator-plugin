@@ -115,6 +115,10 @@ public class GitHubScanner {
         if (offline) {
             return readOffline(index, state, space);
         }
+        if (token == null || token.isBlank()) {
+            state.error("GitHub token is required for online scanning; configure authentication or use offline cache");
+            return new Scan(Map.of(), state.errors);
+        }
         Map<String, Map<String, String>> repositories = new LinkedHashMap<>();
         Map<String, String> objects = new LinkedHashMap<>();
         String listPath = "/orgs/" + segment(organization) + "/repos";
@@ -197,10 +201,10 @@ public class GitHubScanner {
                 if (node.path("truncated").asBoolean()) {
                     throw new SafeFailure("Nonrecursive repository tree is truncated");
                 }
-                entries(node, current.prefix, current.depth, pending, blobs, state);
+                entries(node, current.prefix, current.depth, pending, blobs, state, name);
             }
         } else {
-            entries(tree, "", 0, null, blobs, state);
+            entries(tree, "", 0, null, blobs, state, name);
         }
         Map<String, String> files = new LinkedHashMap<>();
         for (Blob blob : blobs) {
@@ -254,7 +258,7 @@ public class GitHubScanner {
     }
 
     private void entries(JsonNode tree, String prefix, int depth, ArrayDeque<Tree> pending,
-            List<Blob> blobs, State state) throws SafeFailure {
+            List<Blob> blobs, State state, String repository) throws SafeFailure {
         JsonNode entries = tree.path("tree");
         if (!entries.isArray()) {
             throw new SafeFailure("Invalid repository tree");
@@ -268,9 +272,15 @@ public class GitHubScanner {
                 throw new SafeFailure("Invalid repository file path");
             }
             String type = entry.path("type").asText();
-            if ("tree".equals(type) && pending != null) {
+            if ("commit".equals(type)) {
+                fileError(state, repository, path, "Unsupported Git submodule; nested build files were not scanned");
+            } else if ("tree".equals(type) && pending != null) {
                 pending.add(new Tree(checkedSha(entry.path("sha").asText()), path + "/", depth + 1));
             } else if ("blob".equals(type) && relevant(path)) {
+                if ("120000".equals(entry.path("mode").asText())) {
+                    fileError(state, repository, path, "Unsupported symbolic-link build file");
+                    continue;
+                }
                 if (blobs.size() >= MAX_FILES) {
                     throw new SafeFailure("Build file limit exceeded");
                 }
