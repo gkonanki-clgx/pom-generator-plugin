@@ -12,6 +12,7 @@ import java.nio.file.Path;
 import java.util.List;
 
 import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
 
 public class BomWriterTest {
     @Rule public TemporaryFolder temporary = new TemporaryFolder();
@@ -31,18 +32,25 @@ public class BomWriterTest {
         assertFalse(xml.contains("<optional>"));
     }
 
-    @Test public void outputNeverOverwritesByDefaultOrTraversesSymlinks() throws Exception {
+    @Test public void outputNeverOverwritesByDefaultButAllowsExplicitOverwrite() throws Exception {
         Path file = temporary.newFile("pom.xml").toPath();
         Files.writeString(file, "original");
         assertThrows(IllegalArgumentException.class, () -> BomWriter.write(file, "replacement", false));
         assertEquals("original", Files.readString(file));
         Path directory = temporary.newFolder("actual").toPath();
-        Path link = temporary.getRoot().toPath().resolve("link");
-        Files.createSymbolicLink(link, directory);
-        assertThrows(IllegalArgumentException.class, () -> BomWriter.write(link.resolve("output.pom"), "replacement", true));
         Path output = directory.resolve("space-bom.pom");
         BomWriter.write(output, "first", false);
         BomWriter.write(output, "second", true);
         assertEquals("second", Files.readString(output));
+    }
+
+    @Test public void outputNeverTraversesSymlinks() throws Exception {
+        assumeTrue("Requires POSIX filesystem support",
+                temporary.getRoot().toPath().getFileSystem().supportedFileAttributeViews().contains("posix"));
+        Path directory = temporary.newFolder("actual").toPath();
+        Path link = temporary.getRoot().toPath().resolve("link");
+        Files.createSymbolicLink(link, directory);
+        assertThrows(IllegalArgumentException.class, () -> BomWriter.write(link.resolve("output.pom"), "replacement", true));
+        assertFalse(Files.exists(directory.resolve("output.pom")));
     }
 }
