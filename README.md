@@ -17,7 +17,7 @@ The default alignment baseline is **Spring Boot 4.1.1**. The supplied [official 
 
 A public Maven Central HEAD request for `org.springframework.boot:spring-boot-dependencies:4.1.1:pom` returned HTTP 200, verifying artifact availability only. The live Boot model was not resolved/tested here; synthetic fixtures validate the imported-BOM/property-resolution algorithm, not the contents or compatibility of the published Boot BOM.
 
-`verify` runs unit tests and Maven Invoker integration tests under `src/it`. These exercise the real goal against a synthetic offline GitHub cache and local Maven artifacts, including imported BOM/property resolution, deterministic output, and strict refusal of an unmanaged dependency. No access to a live organization is required.
+`verify` runs unit tests and Maven Invoker integration tests under `src/it`. These exercise the real goal against a synthetic offline GitHub cache and local Maven artifacts, including imported BOM/property resolution, deterministic output, and strict refusal of an unmanaged dependency. The fixture seeds its cache with the same private-file helper as the plugin, so it exercises POSIX permissions on Linux/macOS and owner-only ACLs on Windows. CI runs `verify` on Ubuntu and Windows with JDK 25. No access to a live organization is required.
 
 ## GitHub access
 
@@ -146,7 +146,13 @@ Stable-version syntax is deliberately conservative: numeric/dotted releases such
 
 Maven `-o` also enables offline behavior. Populate the explicitly configured cache in an authorized online run before attempting offline generation; offline results reflect that snapshot, not current organization membership or contents. Offline scanning requires no GitHub token and makes no GitHub API requests. An absent/incomplete cache produces diagnostics rather than silently returning an empty successful inventory.
 
-The optional cache requires a filesystem with **POSIX permissions**: its directory must be `0700` and every cache file `0600`; symbolic-link paths are refused. Keep a dedicated private directory and do not broaden permissions or share the cache. The cache snapshot is keyed by API destination, organization, space, exclusion flags and file-size limit; use matching settings when replaying offline.
+The optional cache requires a filesystem that can enforce **owner-only access**, and is validated on every read and write:
+
+- **POSIX** (Linux/macOS): the directory must be exactly `0700` and every cache file exactly `0600`.
+- **Windows/NTFS ACLs** (no POSIX view): the directory and every file must be owned by the current Windows account, and every ALLOW access-control entry must grant only that owner. New entries are created with an owner-only ACL that replaces any inherited parent entries; entries with inherited or explicit access for other principals (for example `Users`, `Everyone`, `Administrators`), an empty/NULL DACL or another owner are refused, never repaired. A cache created by other tools usually inherits broad entries: delete it and repopulate it with the plugin rather than editing ACLs.
+- **Stores without POSIX permissions or ACLs** (for example FAT/exFAT volumes or archives) are refused; the cache is never written or read without enforceable private access.
+
+Symbolic links, and on Windows junctions or other reparse points, are refused for the cache directory, its ancestors and cache files. The Windows ACL view cannot reveal object/callback ACE types, so keep the directory under your own profile or workspace and do not hand-edit its ACLs. Keep a dedicated private directory and do not broaden permissions or share the cache. The cache snapshot is keyed by API destination, organization, space, exclusion flags and file-size limit; use matching settings when replaying offline.
 
 ## Safety and limitations
 

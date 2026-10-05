@@ -53,6 +53,8 @@
           <localRepositoryPath>${project.build.directory}/it-repository</localRepositoryPath>
           <settingsFile>src/it/settings.xml</settingsFile>
           <streamLogs>true</streamLogs>
+          <!-- Fixture scripts seed the private cache with the plugin's PrivateFiles helper. -->
+          <addTestClassPath>true</addTestClassPath>
         </configuration>
         <executions><execution><id>integration-test</id><goals><goal>install</goal><goal>run</goal></goals></execution></executions>
       </plugin>

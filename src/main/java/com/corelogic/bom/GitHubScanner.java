@@ -17,7 +17,6 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayDeque;
@@ -537,22 +536,11 @@ public class GitHubScanner {
         if (cacheDirectory == null) {
             throw new IOException();
         }
-        // Refuse symlink ancestors as well as symlink cache files.
-        Path path = cacheDirectory.getRoot();
-        for (Path part : cacheDirectory) {
-            path = path.resolve(part);
-            if (Files.isSymbolicLink(path)) {
-                throw new IOException();
-            }
-        }
-        if (create && !Files.exists(cacheDirectory, LinkOption.NOFOLLOW_LINKS)) {
-            Files.createDirectories(cacheDirectory, PosixFilePermissions.asFileAttribute(
-                    PosixFilePermissions.fromString("rwx------")));
-        }
-        if (!Files.isDirectory(cacheDirectory, LinkOption.NOFOLLOW_LINKS)
-                || !Files.getPosixFilePermissions(cacheDirectory).equals(
-                        PosixFilePermissions.fromString("rwx------"))) {
-            throw new IOException();
+        // Refuses symlink/reparse-point ancestors and broad POSIX permissions or ACLs; fails closed otherwise.
+        if (create) {
+            PrivateFiles.createDirectories(cacheDirectory);
+        } else {
+            PrivateFiles.checkDirectory(cacheDirectory);
         }
     }
 
@@ -565,12 +553,11 @@ public class GitHubScanner {
         if (!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
             return null;
         }
-        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)
-                || !Files.getPosixFilePermissions(file).equals(PosixFilePermissions.fromString("rw-------"))
-                || Files.size(file) > MAX_TOTAL_BYTES * 6L) {
+        PrivateFiles.checkFile(file);
+        if (Files.size(file) > MAX_TOTAL_BYTES * 6L) {
             throw new IOException();
         }
-        try (var input = Files.newInputStream(file)) {
+        try (var input = Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS)) {
             byte[] data = input.readNBytes(MAX_TOTAL_BYTES * 6 + 1);
             if (data.length > MAX_TOTAL_BYTES * 6) {
                 throw new IOException();
@@ -596,8 +583,7 @@ public class GitHubScanner {
                 }
             }
             staging = cacheDirectory.resolve("." + java.util.UUID.randomUUID() + ".part");
-            Files.createFile(staging, PosixFilePermissions.asFileAttribute(
-                    PosixFilePermissions.fromString("rw-------")));
+            PrivateFiles.createFile(staging);
             JSON.writeValue(staging.toFile(), node);
             if (replace) {
                 Files.move(staging, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);

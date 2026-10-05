@@ -1,6 +1,6 @@
+import com.corelogic.bom.PrivateFiles
 import groovy.json.JsonOutput
 import java.nio.file.Files
-import java.nio.file.attribute.PosixFilePermissions
 import java.security.MessageDigest
 import java.util.jar.JarOutputStream
 
@@ -9,17 +9,15 @@ assert new File(basedir, 'standalone').mkdirs()
 def digest = { text ->
     MessageDigest.getInstance('SHA-256').digest(text.getBytes('UTF-8')).encodeHex().toString()
 }
+// Seed the cache with the plugin's own private-file helper (POSIX 0700/0600 or owner-only ACLs),
+// creating each private entry before any fixture content is written.
 def cache = new File(basedir, 'cache')
-cache.mkdirs()
-if (cache.toPath().getFileSystem().supportedFileAttributeViews().contains('posix')) {
-    Files.setPosixFilePermissions(cache.toPath(), PosixFilePermissions.fromString('rwx------'))
-}
+PrivateFiles.createDirectories(cache.toPath())
 def privateJson = { name, value ->
-    def file = new File(cache, name)
-    file.setText(JsonOutput.toJson(value), 'UTF-8')
-    if (cache.toPath().getFileSystem().supportedFileAttributeViews().contains('posix')) {
-        Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString('rw-------'))
-    }
+    def file = new File(cache, name).toPath()
+    PrivateFiles.createFile(file)
+    Files.write(file, JsonOutput.toJson(value).getBytes('UTF-8'))
+    PrivateFiles.checkFile(file)
 }
 def project = { name, dependencies ->
     """<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>
