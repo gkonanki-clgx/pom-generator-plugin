@@ -21,6 +21,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import static org.junit.Assert.*;
+import static org.junit.Assume.assumeTrue;
 
 public class GitHubScannerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -430,6 +431,8 @@ public class GitHubScannerTest {
 
     @Test
     public void privateImmutableCacheSupportsOfflineAndReusesCommitObjects() throws Exception {
+        assumeTrue("Requires POSIX filesystem permissions",
+                Path.of("target").getFileSystem().supportedFileAttributeViews().contains("posix"));
         Files.createDirectories(Path.of("target"));
         cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
         route("/orgs/acme/repos?per_page=100&page=1", List.of(repo("space-project", "main")));
@@ -464,6 +467,8 @@ public class GitHubScannerTest {
 
     @Test
     public void doesNotPopulatePublicCacheDirectoryOrCachePartialResults() throws Exception {
+        assumeTrue("Requires POSIX filesystem permissions",
+                Path.of("target").getFileSystem().supportedFileAttributeViews().contains("posix"));
         Files.createDirectories(Path.of("target"));
         cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
         Files.createDirectory(cache);
@@ -484,6 +489,8 @@ public class GitHubScannerTest {
 
     @Test
     public void refusesSymlinkCachePaths() throws Exception {
+        assumeTrue("Requires POSIX filesystem permissions",
+                Path.of("target").getFileSystem().supportedFileAttributeViews().contains("posix"));
         Files.createDirectories(Path.of("target"));
         cache = Path.of("target", "github-scanner-cache-" + UUID.randomUUID());
         Files.createDirectory(cache, PosixFilePermissions.asFileAttribute(
