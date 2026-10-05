@@ -409,4 +409,247 @@ public class BuildParserTest {
         assertTrue(result.errors().stream().anyMatch(error -> error.contains("settings.gradle.kts")));
         assertTrue(result.errors().stream().anyMatch(error -> error.contains("dynamic dependencies API")));
     }
+
+    @Test(timeout = 5000)
+    public void rejectsLongMalformedNamedIdentifierWithoutRepeatedSuffixScanning() {
+        var result = parser.parse("fixture", Map.of("build.gradle",
+                "dependencies { implementation(" + "x".repeat(50_000) + ") }"));
+        assertTrue(result.dependencies().isEmpty());
+        assertFalse(result.errors().isEmpty());
+        assertTrue(result.errors().stream().allMatch(error -> error.startsWith("fixture/build.gradle:")));
+    }
+
+    @Test(timeout = 5000)
+    public void leavesLongNestedMalformedPropertiesUnresolvedWithoutRepeatedScanning() {
+        String malformed = "${".repeat(25_000);
+        var result = parser.parse("fixture", Map.of("pom.xml", pom("<dependencies>"
+                + dependency("library", "<version>" + malformed + "</version>") + "</dependencies>")));
+        assertEquals(1, result.dependencies().size());
+        assertEquals(malformed, result.dependencies().get(0).version());
+        assertFalse(result.errors().isEmpty());
+        assertTrue(result.errors().stream().allMatch(error -> error.startsWith("fixture/pom.xml:")));
+    }
+
+    @Test(timeout = 5000)
+    public void rejectsSelfAndMutualPropertyCyclesWithoutExpansionGrowth() {
+        for (String properties : java.util.List.of(
+                "<x>" + "${x}".repeat(10) + "</x>",
+                "<x>${y}</x><y>${x}</y>")) {
+            var result = parser.parse("fixture", Map.of("pom.xml", pom("<properties>" + properties
+                    + "</properties><dependencies>"
+                    + dependency("library", "<version>${x}</version>") + "</dependencies>")));
+            assertEquals("${unresolved}", result.dependencies().get(0).version());
+            assertFalse(result.errors().isEmpty());
+            assertTrue(result.errors().stream().allMatch(error -> error.startsWith("fixture/pom.xml:")));
+        }
+    }
+
+    @Test(timeout = 5000)
+    public void rejectsAcyclicExpansionBombBeforeAllocatingExpandedValue() {
+        StringBuilder properties = new StringBuilder("<x0>1</x0>");
+        for (int i = 1; i <= 10; i++) {
+            properties.append("<x").append(i).append(">")
+                    .append(("${x" + (i - 1) + "}").repeat(10))
+                    .append("</x").append(i).append(">");
+        }
+        var result = parser.parse("fixture", Map.of("pom.xml", pom("<properties>" + properties
+                + "</properties><dependencies>"
+                + dependency("library", "<version>${x10}</version>") + "</dependencies>")));
+        assertEquals("${unresolved}", result.dependencies().get(0).version());
+        assertFalse(result.errors().isEmpty());
+    }
+
+    @Test
+    public void inheritsOrdinaryVersionBeforeChildScopeAndOptionalOverrides() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom("<dependencies>"
+                + dependency("library", "<version>1</version><scope>runtime</scope>")
+                + "</dependencies>"), "child/pom.xml", """
+                <project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId><version>1</version>
+                </parent><artifactId>child</artifactId>
+                <dependencyManagement><dependencies><dependency><groupId>synthetic</groupId>
+                <artifactId>library</artifactId><version>9</version></dependency></dependencies></dependencyManagement>
+                <dependencies><dependency><groupId>synthetic</groupId><artifactId>library</artifactId>
+                <scope>test</scope><optional>true</optional></dependency></dependencies></project>
+                """));
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+        var child = result.dependencies().stream().filter(d -> d.path().equals("child/pom.xml") && !d.management())
+                .findFirst().orElseThrow();
+        assertEquals("1", child.version());
+        assertEquals("test", child.scope());
+        assertTrue(child.optional());
+    }
+
+    private static String aggregateExpansionFixture() {
+        StringBuilder source = new StringBuilder("<properties><large>")
+                .append("x".repeat(60_000)).append("</large></properties><dependencies>");
+        for (int i = 0; i < 1_000; i++) {
+            source.append(dependency("library-" + i, "<version>${large}</version>"));
+        }
+        return pom(source.append("</dependencies>").toString());
+    }
+
+    @Test(timeout = 5000)
+    public void boundsAggregateExpansionAcrossRepeatedLargePropertyReferences() {
+        String source = aggregateExpansionFixture();
+        assertTrue(source.length() < 2 * 1024 * 1024);
+        var result = parser.parse("fixture", Map.of("pom.xml", source));
+        assertTrue(result.errors().stream().anyMatch(error ->
+                error.equals("fixture/pom.xml: aggregate property expansion budget exhausted")));
+        long retainedCharacters = result.dependencies().stream().map(BuildParser.Dependency::version)
+                .filter(java.util.Objects::nonNull).mapToLong(String::length).sum();
+        assertTrue(retainedCharacters < 8 * 1024 * 1024);
+        var next = parser.parse("fixture", Map.of("pom.xml", pom("<dependencies>"
+                + dependency("small", "<version>1</version>") + "</dependencies>")));
+        assertTrue(next.errors().toString(), next.errors().isEmpty());
+        assertEquals("1", next.dependencies().get(0).version());
+    }
+
+    @Test(timeout = 5000)
+    public void concurrentParsesHaveIndependentExpansionBudgets() {
+        String source = aggregateExpansionFixture();
+        var first = java.util.concurrent.CompletableFuture.supplyAsync(() ->
+                parser.parse("fixture-a", Map.of("pom.xml", source)));
+        var second = java.util.concurrent.CompletableFuture.supplyAsync(() ->
+                parser.parse("fixture-b", Map.of("pom.xml", source)));
+        var firstResult = first.join();
+        var secondResult = second.join();
+        assertFalse(firstResult.dependencies().isEmpty());
+        assertEquals(firstResult.dependencies().size(), secondResult.dependencies().size());
+        assertTrue(firstResult.errors().stream().allMatch(error -> error.startsWith("fixture-a/pom.xml:")));
+        assertTrue(secondResult.errors().stream().allMatch(error -> error.startsWith("fixture-b/pom.xml:")));
+    }
+
+    @Test(timeout = 5000)
+    public void enforcesExpansionDepthAndValueSizeBoundaries() {
+        for (int count : java.util.List.of(64, 65)) {
+            StringBuilder properties = new StringBuilder();
+            for (int i = 0; i < count; i++) {
+                properties.append("<x").append(i).append(">")
+                        .append(i == count - 1 ? "1" : "${x" + (i + 1) + "}")
+                        .append("</x").append(i).append(">");
+            }
+            var result = parser.parse("fixture", Map.of("pom.xml", pom("<properties>" + properties
+                    + "</properties><dependencies>" + dependency("library", "<version>${x0}</version>")
+                    + "</dependencies>")));
+            assertEquals(count == 64 ? "1" : "${unresolved}", result.dependencies().get(0).version());
+            assertEquals(count == 64, result.errors().isEmpty());
+        }
+        for (int length : java.util.List.of(65_536, 65_537)) {
+            var result = parser.parse("fixture", Map.of("pom.xml", pom("<properties><large>"
+                    + "x".repeat(length) + "</large></properties><dependencies>"
+                    + dependency("library", "<version>${large}</version>") + "</dependencies>")));
+            assertEquals(length == 65_536 ? length : "${unresolved}".length(),
+                    result.dependencies().get(0).version().length());
+            assertEquals(length == 65_536, result.errors().isEmpty());
+        }
+    }
+
+    @Test
+    public void rejectsInvalidLiteralMavenIdentityFieldsBeforeSelection() {
+        for (String field : java.util.List.of("groupId", "artifactId", "type", "classifier")) {
+            for (String invalid : java.util.List.of("unsafe/path", "unsafe\\path", "unsafe:name",
+                    "unsafe name", ".unsafe")) {
+                String group = field.equals("groupId") ? invalid : "synthetic";
+                String artifact = field.equals("artifactId") ? invalid : "library";
+                String metadata = field.equals("type") || field.equals("classifier")
+                        ? "<" + field + ">" + invalid + "</" + field + ">" : "";
+                var result = parser.parse("fixture", Map.of("pom.xml", pom("<dependencies><dependency>"
+                        + "<groupId>" + group + "</groupId><artifactId>" + artifact + "</artifactId>"
+                        + "<version>1</version>" + metadata + "</dependency></dependencies>")));
+                assertTrue(field + ": " + invalid, result.dependencies().isEmpty());
+                assertFalse(field + ": " + invalid, result.errors().isEmpty());
+                assertTrue(result.errors().stream().allMatch(error -> error.startsWith("fixture/pom.xml:")));
+                assertFalse(result.errors().toString().contains(invalid));
+            }
+        }
+    }
+
+    @Test
+    public void rejectsInvalidLiteralGradleIdentityFieldsBeforeSelection() {
+        for (String field : java.util.List.of("group", "name", "ext", "classifier")) {
+            for (String invalid : java.util.List.of("unsafe/path", "unsafe\\path", "unsafe:name",
+                    "unsafe name", ".unsafe")) {
+                String group = field.equals("group") ? invalid : "synthetic";
+                String artifact = field.equals("name") ? invalid : "library";
+                String metadata = field.equals("ext") || field.equals("classifier")
+                        ? ", " + field + " = \"" + invalid + "\"" : "";
+                var result = parser.parse("fixture", Map.of("build.gradle.kts",
+                        "dependencies { implementation(group = \"" + group + "\", name = \""
+                                + artifact + "\", version = \"1\"" + metadata + ") }"));
+                assertTrue(field + ": " + invalid, result.dependencies().isEmpty());
+                assertFalse(field + ": " + invalid, result.errors().isEmpty());
+                assertTrue(result.errors().stream().allMatch(error -> error.startsWith("fixture/build.gradle.kts:")));
+                assertFalse(result.errors().toString().contains(invalid));
+            }
+        }
+        var quoted = parser.parse("fixture", Map.of("build.gradle",
+                "dependencies { implementation 'synthetic:unsafe/path:1' }"));
+        assertTrue(quoted.dependencies().isEmpty());
+        assertFalse(quoted.errors().isEmpty());
+    }
+
+    @Test
+    public void preservesObservedSnapshotVersionsForDownstreamPolicyAlignment() {
+        var result = parser.parse("fixture", Map.of("pom.xml", pom("<dependencies>"
+                + dependency("maven", "<version>1-SNAPSHOT</version>") + "</dependencies>"),
+                "build.gradle", "dependencies { implementation 'synthetic:gradle:2-SNAPSHOT' }"));
+        assertTrue(result.errors().toString(), result.errors().isEmpty());
+        assertEquals(java.util.List.of("1-SNAPSHOT", "2-SNAPSHOT"),
+                result.dependencies().stream().map(BuildParser.Dependency::version).toList());
+    }
+
+    @Test(timeout = 5000)
+    public void reportsOverLimitLocalPropertyMapsBeforeCopyingIntoChildModels() {
+        StringBuilder properties = new StringBuilder("<properties>");
+        for (int i = 0; i < 3_000; i++) properties.append("<p").append(i).append(">1</p").append(i).append(">");
+        properties.append("</properties>");
+        var result = parser.parse("fixture", Map.of("pom.xml", pom(properties.toString())));
+        assertTrue(result.dependencies().isEmpty());
+        assertEquals(java.util.List.of(
+                "fixture/pom.xml: property map exceeds 2048 distinct entries; parsing incomplete"), result.errors());
+    }
+
+    @Test(timeout = 5000)
+    public void boundsDistinctEffectivePropertiesBeforeInheritanceCopy() {
+        StringBuilder parentProperties = new StringBuilder("<properties>");
+        StringBuilder childProperties = new StringBuilder("<properties>");
+        for (int i = 0; i < 1_100; i++) {
+            parentProperties.append("<parent").append(i).append(">1</parent").append(i).append(">");
+            childProperties.append("<child").append(i).append(">1</child").append(i).append(">");
+        }
+        parentProperties.append("</properties>");
+        childProperties.append("</properties>");
+        var result = parser.parse("fixture", Map.of("pom.xml", pom(parentProperties.toString()),
+                "child/pom.xml", "<project><parent><groupId>synthetic</groupId><artifactId>sample</artifactId>"
+                        + "<version>1</version></parent><artifactId>child</artifactId>" + childProperties + "</project>"));
+        assertEquals(java.util.List.of(
+                "fixture/child/pom.xml: property map exceeds 2048 distinct entries; parsing incomplete"), result.errors());
+    }
+
+    @Test(timeout = 5000)
+    public void boundsGradlePropertyMapsWithExplicitProvenanceErrors() {
+        StringBuilder properties = new StringBuilder();
+        for (int i = 0; i < 3_000; i++) properties.append("p").append(i).append("=1\n");
+        var result = parser.parse("fixture", Map.of("gradle.properties", properties.toString(),
+                "build.gradle", "dependencies { implementation 'synthetic:library:1' }"));
+        assertTrue(result.dependencies().isEmpty());
+        assertEquals(java.util.List.of(
+                "fixture/build.gradle: property map exceeds 2048 distinct entries; parsing incomplete"), result.errors());
+    }
+
+    @Test(timeout = 5000)
+    public void boundsRelativeParentRecursionDepth() {
+        java.util.Map<String, String> files = new java.util.HashMap<>();
+        for (int i = 0; i < 70; i++) {
+            String parent = i == 69 ? "" : "<parent><groupId>synthetic</groupId><artifactId>project"
+                    + (i + 1) + "</artifactId><version>1</version><relativePath>../"
+                    + String.format("%02d", i + 1) + "/pom.xml</relativePath></parent>";
+            files.put(String.format("%02d/pom.xml", i), "<project>" + parent + "<groupId>synthetic</groupId>"
+                    + "<artifactId>project" + i + "</artifactId><version>1</version></project>");
+        }
+        var result = parser.parse("fixture", files);
+        assertTrue(result.errors().stream().anyMatch(error ->
+                error.equals("fixture/64/pom.xml: relative parent nesting exceeds 64 project levels; parsing incomplete")));
+        assertTrue(result.errors().stream().allMatch(error -> error.startsWith("fixture/")));
+    }
 }

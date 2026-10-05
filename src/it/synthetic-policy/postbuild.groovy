@@ -37,6 +37,8 @@ assert managed.distinctRepositoryCount == 2 && managed.chosenVersion == '2.3.0'
 assert managed.observedVersions == ['0.1.0', '0.2.0']
 assert managed.provenance.size() == 3
 assert report == new JsonSlurper().parse(new File(basedir, 'second/dda-bom-report.json'))
+assert Arrays.equals(new File(basedir, 'first/dda-bom-report.json').bytes,
+    new File(basedir, 'second/dda-bom-report.json').bytes): 'Diagnostic report must be byte-identical across JVM invocations'
 
 assert !new File(basedir, 'strict-failure/dds-bom.pom').exists()
 def failure = new JsonSlurper().parse(new File(basedir, 'strict-failure/dds-bom-report.json'))

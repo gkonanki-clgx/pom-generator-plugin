@@ -25,6 +25,11 @@ import org.xml.sax.helpers.DefaultHandler;
  * Buildscript classpath dependencies are excluded, like Maven plugin dependencies.
  * Only literal Gradle assignments and gradle.properties interpolation are supported.
  * Versionless Gradle coordinates are retained for downstream dependency management.
+ * Cyclic interpolation, nesting beyond 64 levels, and expanded values beyond 64 KiB
+ * remain unresolved rather than being evaluated or truncated.
+ * Each parse also limits aggregate interpolation work to 8 MiB of characters.
+ * Local/effective property maps have at most 2048 distinct entries, including
+ * built-in aliases; relative-parent traversal is limited to 64 project levels.
  */
 public class BuildParser {
     public record Dependency(String groupId, String artifactId, String version, String type,
@@ -38,29 +43,47 @@ public class BuildParser {
 
     public record Result(List<Dependency> dependencies, List<String> errors) {}
 
-    private static final Pattern PROPERTY = Pattern.compile("\\$\\{([^}]+)}|\\$([A-Za-z_]\\w*)");
+    private static final Pattern PROPERTY = Pattern.compile("\\$\\{([^{}]+)}|\\$([A-Za-z_]\\w*)");
     private static final Pattern ASSIGNMENT = Pattern.compile(
             "(?m)^\\s*(?:(?:def|val|var)\\s+|ext\\.)?([A-Za-z_]\\w*)\\s*=\\s*(['\"])(.*?)\\2\\s*;?\\s*$");
     private static final Pattern FIELD = Pattern.compile(
-            "([\\w.-]+)\\s*[:=]\\s*(\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|[\\w.$]+)");
+            "(?<![\\w.-])([\\w.-]+)\\s*[:=]\\s*(\"(?:\\\\.|[^\"\\\\])*\"|'(?:\\\\.|[^'\\\\])*'|[\\w.$]+)");
+    private static final Pattern SAFE_IDENTIFIER = Pattern.compile("[A-Za-z0-9_][A-Za-z0-9_.-]*");
+    private static final int MAX_EXPANSION_LENGTH = 65_536;
+    private static final int MAX_EXPANSION_DEPTH = 64;
+    private static final String UNRESOLVED_EXPANSION = "${unresolved}";
+    private static final int MAX_EXPANSION_WORK = 8 * 1024 * 1024;
+    private static final int MAX_PROPERTY_ENTRIES = 2048;
+    private static final int MAX_PARENT_DEPTH = 64;
 
     public Result parse(String repository, Map<String, String> files) {
         List<Dependency> dependencies = new ArrayList<>();
         Set<String> errors = new LinkedHashSet<>();
+        ExpansionBudget budget = new ExpansionBudget();
         Map<String, String> normalized = new LinkedHashMap<>();
         files.forEach((path, text) -> normalized.put(normalize(path), text));
         Map<String, MavenModel> models = new HashMap<>();
         for (String path : normalized.keySet().stream().sorted().toList()) {
             if (path.equals("pom.xml") || path.endsWith("/pom.xml")) {
-                MavenModel model = maven(repository, path, normalized, models, new LinkedHashSet<>(), errors);
+                MavenModel model = maven(repository, path, normalized, models, new LinkedHashSet<>(), errors, budget);
                 dependencies.addAll(model.dependencies);
             }
         }
         for (String path : normalized.keySet().stream().sorted().toList()) {
             if (path.equals("build.gradle") || path.endsWith("/build.gradle")
                     || path.equals("build.gradle.kts") || path.endsWith("/build.gradle.kts")) {
-                gradle(repository, path, normalized, dependencies, errors);
+                try {
+                    gradle(repository, path, normalized, dependencies, errors, budget);
+                } catch (PropertyLimitFailure failure) {
+                    error(errors, repository, path, "property map exceeds 2048 distinct entries; parsing incomplete");
+                }
             }
+        }
+        if (budget.exhausted) {
+            normalized.keySet().stream().sorted().filter(path -> path.equals("pom.xml") || path.endsWith("/pom.xml")
+                    || path.equals("build.gradle") || path.endsWith("/build.gradle")
+                    || path.equals("build.gradle.kts") || path.endsWith("/build.gradle.kts")).findFirst()
+                    .ifPresent(path -> error(errors, repository, path, "aggregate property expansion budget exhausted"));
         }
         return new Result(List.copyOf(dependencies), List.copyOf(errors));
     }
@@ -74,19 +97,29 @@ public class BuildParser {
     }
 
     private static class MavenModel {
-        final Map<String, String> properties = new HashMap<>();
+        final ExpansionProperties properties;
         final Map<String, Dependency> managed = new HashMap<>();
         final Map<String, Element> managedDeclarations = new LinkedHashMap<>();
         final List<Element> declarations = new ArrayList<>();
         final List<Dependency> dependencies = new ArrayList<>();
+
+        MavenModel(ExpansionBudget budget) {
+            properties = new ExpansionProperties(budget);
+        }
     }
 
     private MavenModel maven(String repo, String path, Map<String, String> files,
-                             Map<String, MavenModel> cache, Set<String> visiting, Set<String> errors) {
+                             Map<String, MavenModel> cache, Set<String> visiting, Set<String> errors,
+                             ExpansionBudget budget) {
         if (cache.containsKey(path)) return cache.get(path);
-        MavenModel model = new MavenModel();
+        MavenModel model = new MavenModel(budget);
         if (!visiting.add(path)) {
             error(errors, repo, path, "cyclic relative parent");
+            return model;
+        }
+        if (visiting.size() > MAX_PARENT_DEPTH) {
+            visiting.remove(path);
+            error(errors, repo, path, "relative parent nesting exceeds 64 project levels; parsing incomplete");
             return model;
         }
         try {
@@ -108,7 +141,7 @@ public class BuildParser {
             Map<String, String> ownProperties = new HashMap<>();
             Element props = child(project, "properties");
             if (props != null) for (Element property : children(props)) {
-                ownProperties.put(name(property), property.getTextContent().trim());
+                putProperty(ownProperties, name(property), property.getTextContent().trim());
             }
             Element parent = child(project, "parent");
             List<Element> inheritedDeclarations = new ArrayList<>();
@@ -120,8 +153,9 @@ public class BuildParser {
                     parentPath = normalize(parentPath + "/pom.xml");
                 }
                 if (!relative.isEmpty() && files.containsKey(parentPath)) {
-                    MavenModel inherited = maven(repo, parentPath, files, cache, visiting, errors);
-                    Map<String, String> comparisonProperties = new HashMap<>(inherited.properties);
+                    MavenModel inherited = maven(repo, parentPath, files, cache, visiting, errors, budget);
+                    ExpansionProperties comparisonProperties = new ExpansionProperties(budget);
+                    comparisonProperties.putAll(inherited.properties);
                     comparisonProperties.putAll(ownProperties);
                     boolean matches = true;
                     for (String coordinate : List.of("groupId", "artifactId", "version")) {
@@ -181,11 +215,17 @@ public class BuildParser {
             List<Dependency> directDependencies = new ArrayList<>();
             List<Element> directDeclarations = new ArrayList<>();
             Set<String> directKeys = new LinkedHashSet<>();
+            Map<String, Element> inheritedByKey = new HashMap<>();
+            for (Element dep : inheritedDeclarations) {
+                inheritedByKey.put(declarationKey(dep, model.properties), dep);
+            }
             for (Element dep : children(child(project, "dependencies"), "dependency")) {
-                Dependency dependency = mavenDependency(repo, path, dep, model, false, errors);
+                Element inherited = inheritedByKey.get(declarationKey(dep, model.properties));
+                Element effective = inherited == null ? dep : mergeDeclaration(inherited, dep);
+                Dependency dependency = mavenDependency(repo, path, effective, model, false, errors);
                 if (dependency != null) {
                     directDependencies.add(dependency);
-                    directDeclarations.add(dep);
+                    directDeclarations.add(effective);
                     directKeys.add(dependency.key());
                 }
             }
@@ -201,6 +241,8 @@ public class BuildParser {
             if (!children(child(project, "profiles")).isEmpty()) {
                 error(errors, repo, path, "profile-dependent dependencies are incomplete");
             }
+        } catch (PropertyLimitFailure failure) {
+            error(errors, repo, path, "property map exceeds 2048 distinct entries; parsing incomplete");
         } catch (Exception ex) {
             // Parser exceptions can contain source fragments: never expose their messages.
             error(errors, repo, path, "invalid or unsafe Maven XML");
@@ -222,8 +264,9 @@ public class BuildParser {
         String optional = expand(value(element, "optional"), model.properties);
         if (type == null || type.isBlank()) type = "jar";
         if (classifier == null) classifier = "";
-        if (!staticValue(group) || !staticValue(artifact)) {
-            error(errors, repo, path, "unresolved dependency coordinates or properties");
+        if (!safeIdentifier(group) || !safeIdentifier(artifact) || !safeIdentifier(type)
+                || (!classifier.isEmpty() && !safeIdentifier(classifier))) {
+            error(errors, repo, path, "unresolved or unsupported dependency coordinates or properties");
             return null;
         }
         String key = group + ":" + artifact + ":" + type + ":" + classifier;
@@ -232,8 +275,8 @@ public class BuildParser {
         if (scope == null && managed != null) scope = managed.scope();
         if (optional == null && managed != null) optional = Boolean.toString(managed.optional());
         if (scope == null) scope = "compile";
-        if (!staticValue(version) || !staticValue(type) || classifier.contains("$")
-                || !staticValue(scope) || (optional != null && !optional.equals("true") && !optional.equals("false"))) {
+        if (!staticValue(version) || !staticValue(scope)
+                || (optional != null && !optional.equals("true") && !optional.equals("false"))) {
             error(errors, repo, path, "unresolved dependency version, metadata or properties");
         }
         if (dynamicVersion(version)) error(errors, repo, path, "dynamic dependency version is incomplete");
@@ -246,6 +289,10 @@ public class BuildParser {
 
     private static boolean staticValue(String value) {
         return value != null && !value.isBlank() && !value.contains("$");
+    }
+
+    private static boolean safeIdentifier(String value) {
+        return value != null && SAFE_IDENTIFIER.matcher(value).matches();
     }
 
     private static boolean dynamicVersion(String value) {
@@ -262,20 +309,125 @@ public class BuildParser {
         return normalize((parent == null ? Path.of("") : parent).resolve(relative).toString());
     }
 
-    private static String expand(String text, Map<String, String> properties) {
-        if (text == null) return null;
-        for (int iteration = 0; iteration < 20; iteration++) {
-            Matcher matcher = PROPERTY.matcher(text);
-            StringBuilder result = new StringBuilder();
-            while (matcher.find()) {
-                String replacement = properties.get(matcher.group(1) == null ? matcher.group(2) : matcher.group(1));
-                matcher.appendReplacement(result, Matcher.quoteReplacement(replacement == null ? matcher.group() : replacement));
+    private static class ExpansionBudget {
+        int remaining = MAX_EXPANSION_WORK;
+        boolean exhausted;
+
+        void consume(int characters) {
+            if (characters > remaining) {
+                exhausted = true;
+                remaining = 0;
+                throw new ExpansionFailure();
             }
-            matcher.appendTail(result);
-            if (result.toString().equals(text)) return text;
-            text = result.toString();
+            remaining -= characters;
         }
-        return text;
+    }
+
+    private static class ExpansionProperties extends HashMap<String, String> {
+        final ExpansionBudget budget;
+
+        ExpansionProperties(ExpansionBudget budget) {
+            this.budget = budget;
+        }
+
+        @Override
+        public String put(String key, String value) {
+            checkPropertyEntry(this, key);
+            return super.put(key, value);
+        }
+
+        @Override
+        public void putAll(Map<? extends String, ? extends String> properties) {
+            int entries = size();
+            for (String key : properties.keySet()) {
+                if (!containsKey(key) && ++entries > MAX_PROPERTY_ENTRIES) throw new PropertyLimitFailure();
+            }
+            super.putAll(properties);
+        }
+    }
+
+    private static class PropertyLimitFailure extends RuntimeException {}
+
+    private static void checkPropertyEntry(Map<String, String> properties, String key) {
+        if (!properties.containsKey(key) && properties.size() >= MAX_PROPERTY_ENTRIES) {
+            throw new PropertyLimitFailure();
+        }
+    }
+
+    private static void putProperty(Map<String, String> properties, String key, String value) {
+        checkPropertyEntry(properties, key);
+        properties.put(key, value);
+    }
+
+    private static String expand(String text, ExpansionProperties properties) {
+        if (text == null) return null;
+        try {
+            properties.budget.consume(16);
+            return expandBounded(text, properties, new HashMap<>(), new LinkedHashSet<>(), 0, properties.budget);
+        } catch (ExpansionFailure failure) {
+            return UNRESOLVED_EXPANSION;
+        }
+    }
+
+    private static class ExpansionFailure extends RuntimeException {}
+
+    private static String expandBounded(String text, Map<String, String> properties,
+                                       Map<String, String> memo, Set<String> visiting, int depth,
+                                       ExpansionBudget budget) {
+        if (text.length() > MAX_EXPANSION_LENGTH || depth > MAX_EXPANSION_DEPTH) throw new ExpansionFailure();
+        budget.consume(16);
+        Matcher matcher = PROPERTY.matcher(text);
+        StringBuilder result = new StringBuilder();
+        int previous = 0;
+        while (matcher.find()) {
+            appendBounded(result, text, previous, matcher.start(), budget);
+            int group = matcher.start(1) < 0 ? 2 : 1;
+            budget.consume(matcher.end(group) - matcher.start(group));
+            String key = matcher.group(group);
+            String replacement = memo.get(key);
+            if (replacement == null) {
+                String raw = properties.get(key);
+                if (raw == null) {
+                    budget.consume(matcher.end() - matcher.start());
+                    replacement = matcher.group();
+                }
+                else {
+                    if (!visiting.add(key)) throw new ExpansionFailure();
+                    replacement = expandBounded(raw, properties, memo, visiting, depth + 1, budget);
+                    visiting.remove(key);
+                    memo.put(key, replacement);
+                }
+            }
+            appendBounded(result, replacement, 0, replacement.length(), budget);
+            previous = matcher.end();
+        }
+        appendBounded(result, text, previous, text.length(), budget);
+        budget.consume(result.length());
+        return result.toString();
+    }
+
+    private static void appendBounded(StringBuilder result, String text, int start, int end, ExpansionBudget budget) {
+        if (end - start > MAX_EXPANSION_LENGTH - result.length()) throw new ExpansionFailure();
+        budget.consume(end - start);
+        result.append(text, start, end);
+    }
+
+    private static String declarationKey(Element element, ExpansionProperties properties) {
+        String type = expand(value(element, "type"), properties);
+        String classifier = expand(value(element, "classifier"), properties);
+        return expand(value(element, "groupId"), properties) + ":"
+                + expand(value(element, "artifactId"), properties) + ":"
+                + (type == null || type.isBlank() ? "jar" : type) + ":"
+                + (classifier == null ? "" : classifier);
+    }
+
+    private static Element mergeDeclaration(Element inherited, Element direct) {
+        Element merged = (Element) inherited.cloneNode(true);
+        for (Element field : children(direct)) {
+            for (Element old : children(merged, name(field))) merged.removeChild(old);
+            merged.appendChild(merged.getOwnerDocument().importNode(field, true));
+        }
+        return merged;
     }
 
     private static String name(Element element) {
@@ -305,9 +457,9 @@ public class BuildParser {
     }
 
     private void gradle(String repo, String path, Map<String, String> files,
-                        List<Dependency> dependencies, Set<String> errors) {
+                        List<Dependency> dependencies, Set<String> errors, ExpansionBudget budget) {
         String source = stripComments(files.get(path));
-        Map<String, String> variables = new HashMap<>();
+        ExpansionProperties variables = new ExpansionProperties(budget);
         loadProperties(files.get("gradle.properties"), variables);
         loadProperties(files.get(resolvePath(path, "gradle.properties")), variables);
         Matcher assignments = ASSIGNMENT.matcher(source);
@@ -319,7 +471,7 @@ public class BuildParser {
                 variables.remove(allAssignments.group(1));
             }
         }
-        Map<String, String> catalogs = catalogs(repo, path, files, errors);
+        Map<String, String> catalogs = catalogs(repo, path, files, errors, budget);
         String structure = maskStrings(source);
         Matcher buildscript = Pattern.compile("\\bbuildscript\\s*\\{").matcher(structure);
         StringBuilder projectStructure = new StringBuilder(structure);
@@ -376,7 +528,7 @@ public class BuildParser {
         }
     }
 
-    private void gradleStatement(String repo, String path, String statement, Map<String, String> variables,
+    private void gradleStatement(String repo, String path, String statement, ExpansionProperties variables,
                                  Map<String, String> catalogs, List<Dependency> dependencies, Set<String> errors) {
         statement = statement.trim();
         if (statement.isEmpty()) return;
@@ -437,12 +589,12 @@ public class BuildParser {
                 error(errors, repo, path, "unsupported named dependency metadata");
             }
         }
-        if (!staticValue(group) || !staticValue(artifact)) {
-            error(errors, repo, path, "unresolved dependency coordinates or properties");
+        if (!safeIdentifier(group) || !safeIdentifier(artifact) || !safeIdentifier(type)
+                || (!classifier.isEmpty() && !safeIdentifier(classifier))) {
+            error(errors, repo, path, "unresolved or unsupported dependency coordinates or properties");
             return;
         }
-        if ((version != null && (!staticValue(version) || dynamicVersion(version)))
-                || !staticValue(type) || classifier.contains("$")) {
+        if (version != null && (!staticValue(version) || dynamicVersion(version))) {
             error(errors, repo, path, "unresolved or dynamic dependency version or metadata");
         }
         String scope = configuration.toLowerCase().contains("test") ? "test"
@@ -464,7 +616,7 @@ public class BuildParser {
         return text;
     }
 
-    private static String literal(String text, Map<String, String> variables) {
+    private static String literal(String text, ExpansionProperties variables) {
         if (text.length() >= 2 && (text.charAt(0) == '"' || text.charAt(0) == '\'')
                 && text.charAt(text.length() - 1) == text.charAt(0)) {
             char quote = text.charAt(0);
@@ -479,7 +631,7 @@ public class BuildParser {
         return null;
     }
 
-    private static Map<String, String> fields(String text, Map<String, String> variables) {
+    private static Map<String, String> fields(String text, ExpansionProperties variables) {
         Map<String, String> result = new HashMap<>();
         Matcher matcher = FIELD.matcher(text);
         while (matcher.find()) {
@@ -495,8 +647,10 @@ public class BuildParser {
         return remainder.isEmpty() && FIELD.matcher(text).find();
     }
 
-    private Map<String, String> catalogs(String repo, String path, Map<String, String> files, Set<String> errors) {
+    private Map<String, String> catalogs(String repo, String path, Map<String, String> files, Set<String> errors,
+                                         ExpansionBudget budget) {
         Map<String, String> result = new HashMap<>();
+        ExpansionProperties noVariables = new ExpansionProperties(budget);
         String catalogPath = "gradle/libs.versions.toml";
         String source = files.get(catalogPath);
         if (source == null) return result;
@@ -518,15 +672,15 @@ public class BuildParser {
             String alias = line.substring(0, equals).trim().replace('_', '-').replace('.', '-');
             String expression = line.substring(equals + 1).trim();
             if (section.equals("versions")) {
-                String version = literal(expression, Map.of());
+                String version = literal(expression, noVariables);
                 if (version == null) error(errors, repo, catalogPath, "dynamic catalog version is incomplete");
                 else versions.put(alias, version);
             } else if (section.equals("libraries")) {
-                String coordinates = literal(expression, Map.of());
+                String coordinates = literal(expression, noVariables);
                 if (coordinates != null) result.put(alias, coordinates);
                 else if (expression.startsWith("{") && expression.endsWith("}")
                         && validFields(expression.substring(1, expression.length() - 1))) {
-                    libraries.put(alias, fields(expression, Map.of()));
+                    libraries.put(alias, fields(expression, noVariables));
                 } else error(errors, repo, catalogPath, "unsupported catalog library declaration");
             } else if (!section.equals("plugins") && !section.equals("bundles")) {
                 error(errors, repo, catalogPath, "unsupported version catalog table");

@@ -97,6 +97,17 @@ public class GenerateBomMojoTest {
         }
     }
 
+    @Test public void metadataBudgetWritesIncompleteReportInsteadOfRetainingUnboundedInventory() throws Exception {
+        try (Fixture fixture = new Fixture(false)) {
+            GenerateBomMojo mojo = fixture.mojo();
+            set(mojo, "inventoryCharacterLimit", 1);
+            assertThrows(MojoExecutionException.class, mojo::execute);
+            assertFalse(fixture.report().path("complete").asBoolean());
+            assertTrue(fixture.report().path("errors").toString().contains("Inventory metadata processing limit exceeded"));
+            assertFalse(Files.exists(fixture.output.resolve("space-bom.pom")));
+        }
+    }
+
     private static JsonNode observation(JsonNode report, String key) {
         for (JsonNode node : report.path("dependencies")) if (key.equals(node.path("coordinate").asText())) return node;
         throw new AssertionError("Missing observation " + key);

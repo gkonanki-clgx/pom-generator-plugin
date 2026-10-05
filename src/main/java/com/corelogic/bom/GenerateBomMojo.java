@@ -25,6 +25,7 @@ import java.util.TreeSet;
 
 @Mojo(name = "generate-bom", requiresProject = false, threadSafe = true)
 public final class GenerateBomMojo extends AbstractMojo {
+    private int inventoryCharacterLimit = 16 * 1024 * 1024;
     @Parameter(property = "organization", defaultValue = "corelogic-private")
     private String organization;
     @Parameter(property = "space", required = true)
@@ -100,11 +101,21 @@ public final class GenerateBomMojo extends AbstractMojo {
             List<Map<String, Object>> scanned = new ArrayList<>();
             List<Map<String, Object>> management = new ArrayList<>();
             BuildParser parser = new BuildParser();
+            long inventoryCharacters = 0;
+            repositoriesLoop:
             for (var repository : repositories.entrySet()) {
                 scanned.add(Map.of("repository", repository.getKey(), "paths", new TreeSet<>(repository.getValue().keySet())));
                 BuildParser.Result parsed = parser.parse(repository.getKey(), repository.getValue());
                 errors.addAll(parsed.errors());
                 for (BuildParser.Dependency d : parsed.dependencies()) {
+                    long characters = 2L * d.key().length() + repository.getKey().length() + d.path().length()
+                            + (d.version() == null ? 0 : d.version().length())
+                            + (d.scope() == null ? 0 : d.scope().length());
+                    if (characters > inventoryCharacterLimit - inventoryCharacters) {
+                        errors.add("Inventory metadata processing limit exceeded; use a narrower repository prefix");
+                        break repositoriesLoop;
+                    }
+                    inventoryCharacters += characters;
                     if (d.management()) {
                         management.add(Map.of("repository", repository.getKey(), "path", d.path(), "coordinate", d.key(),
                                 "observedVersion", d.version() == null ? "" : d.version()));
