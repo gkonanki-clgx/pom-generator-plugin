@@ -11,11 +11,15 @@ def digest = { text ->
 }
 def cache = new File(basedir, 'cache')
 cache.mkdirs()
-Files.setPosixFilePermissions(cache.toPath(), PosixFilePermissions.fromString('rwx------'))
+if (cache.toPath().getFileSystem().supportedFileAttributeViews().contains('posix')) {
+    Files.setPosixFilePermissions(cache.toPath(), PosixFilePermissions.fromString('rwx------'))
+}
 def privateJson = { name, value ->
     def file = new File(cache, name)
     file.setText(JsonOutput.toJson(value), 'UTF-8')
-    Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString('rw-------'))
+    if (cache.toPath().getFileSystem().supportedFileAttributeViews().contains('posix')) {
+        Files.setPosixFilePermissions(file.toPath(), PosixFilePermissions.fromString('rw-------'))
+    }
 }
 def project = { name, dependencies ->
     """<project xmlns="http://maven.apache.org/POM/4.0.0"><modelVersion>4.0.0</modelVersion>
