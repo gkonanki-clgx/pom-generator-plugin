@@ -48,6 +48,7 @@ public final class PrivateFiles {
             UserPrincipal user = ACL.equals(mode) ? currentUser(path.getFileSystem()) : null;
             FileAttribute<?> attribute = initialAttribute(mode, user, true);
             Path parent = path.getParent();
+            // Only the leaf is guaranteed and validated as private; missing parents merely start restricted.
             if (parent != null) {
                 Files.createDirectories(parent, attribute);
             }
@@ -212,7 +213,7 @@ public final class PrivateFiles {
                     NTSystem system = new NTSystem();
                     name = system.getDomain() + "\\" + system.getName();
                 } catch (RuntimeException | LinkageError e) {
-                    throw new IOException("Current user unavailable");
+                    throw new IOException("Current user unavailable", e);
                 }
             }
             if (name == null || name.isEmpty()) {
